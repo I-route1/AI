@@ -6,6 +6,16 @@ __pycache__/
 # C extensions
 *.so
 
+# AI Hub 데이터 및 파싱 결과물 제외
+raw_data/
+processed_data/
+datasets/
+
+# 대용량 파일 확장자 제외
+*.json
+*.jsonl
+*.csv
+
 # Distribution / packaging
 .Python
 build/
