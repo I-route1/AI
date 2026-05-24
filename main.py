@@ -9,13 +9,13 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 import re
 
-from src.api.routers import counseling, predictor, writing
+from src.api.routers import counseling, predictor, rag
 
 app = FastAPI(title="iRoute AI Server")
 
 app.include_router(counseling.router, prefix="/api/ai", tags=["counseling"])
 app.include_router(predictor.router, prefix="/api/ai", tags=["predictor"])
-app.include_router(writing.router, prefix="/api/writing", tags=["writing"])
+app.include_router(rag.router, prefix="/api/rag", tags=["rag"])
 
 # ✅ 4bit 양자화 설정
 bnb_config = BitsAndBytesConfig(
@@ -49,7 +49,7 @@ math_model = AutoModelForCausalLM.from_pretrained(
 )
 
 # RAG 로드
-DB_DIR = os.path.join(os.path.dirname(__file__), "rag_db")
+DB_DIR = os.path.join(os.path.dirname(__file__), "src", "api", "rag_db")
 embeddings = HuggingFaceEmbeddings(
     model_name="jhgan/ko-sroberta-multitask",
     model_kwargs={"device": "cpu"},
@@ -133,19 +133,12 @@ def generate_subject_recommendation(
     raw_text = result_text.split("개념 요약:")[-1].strip()
 
     def refine_text(text: str) -> str:
-        # A. HTML 태그 제거 (예: <table... 등)
         text = re.sub(r'<[^>]*>', '', text)
-
-        # B. 너무 많은 줄바꿈을 2개로 통일
         text = re.sub(r'\n{3,}', '\n\n', text)
-
-        # C. 모델이 생성한 불필요한 마크다운 문법이나 텍스트 정리
-        # (예: "###" 문구나 불필요한 공백 제거)
         text = text.replace("###", "").replace("  ", " ").strip()
-
         return text
 
-    clean_text = re.sub(r'<[^>]*>', '', raw_text).strip()
+    clean_text = refine_text(raw_text)
 
     return {
         "studentId": student_id,

@@ -9,9 +9,9 @@ router = APIRouter()
 MODEL_PATH = "src/models/score_predictor/score_prediction_model.pkl"
 try:
     model = joblib.load(MODEL_PATH)
-    print("✅ [Predictor] 머신러닝 예측 모델 로드 완료!")
+    print("[Predictor] 머신러닝 예측 모델 로드 완료!")
 except FileNotFoundError:
-    print("❌ [Predictor] 모델 파일을 찾을 수 없습니다.")
+    print("[Predictor] 모델 파일을 찾을 수 없습니다.")
     model = None
 
 @router.post("/predict", response_model=PredictionResponse)

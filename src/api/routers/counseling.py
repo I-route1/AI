@@ -1,32 +1,75 @@
 from fastapi import APIRouter
-from src.api.schemas.counseling import ReportGenerationRequest
+from src.api.routers.rag import vector_search
 
 router = APIRouter()
 
-@router.post("/report")
-async def generate_academy_report(req: ReportGenerationRequest):
+# AIHUB 상담 데이터 (실제 연동 전 대표 샘플)
+_COUNSELING_DATA = {
+    "summary": "스포츠에 관심을 가지고 있으며 스포츠 관련 기자가 되기를 희망하고 있다.",
+    "expert_comment": "1순위로는 언어 관련 전문 직종을 추천할 수 있다. 글쓰기 역량 강화가 핵심이다.",
+}
 
-    # AIHUB 원본 상담 데이터 로드 (가상 예시)
-    counseling_data = {
-        "summary": "스포츠에 관심을 가지고 있으며... 스포츠 관련 기자가 되기를 희망하고 있다.",
-        "expert_comment": "1순위로는 언어 관련 전문 직종을 추천할 수 있다..."
-    }
 
-    # LLaMA 3.1 텍스트 생성 시뮬레이션
-    generated_report = f"""
-    # i-Route 프리미엄 AI 진단 리포트
-    
-    **학생 코드:** {req.studentId}
-    **국어 성적:** 상위 {req.currentKoreanGrade}%
-    
-    🎤 **진로 동기 분석 및 공감**
-    {counseling_data['summary']}를 바탕으로 훌륭한 열정을 확인했습니다.
-    
-    🚀 **학원 연계 학습 가이드**
-    전문가 소견({counseling_data['expert_comment']})에 따라 국어 역량 강화가 필수적입니다.
-    """
+def _base_report(req: dict, title: str, focus: str) -> dict:
+    student_id = req.get("studentId", "Unknown")
+    korean_grade = req.get("currentKoreanGrade", 0)
+    study_time = req.get("studyTime", 0)
+    student_note = req.get("studentNote", "")
+    recommend_ctx = req.get("recommendContext", "")
+
+    career_analysis = (
+        f"[{focus}] {_COUNSELING_DATA['summary']} "
+        f"학생 메모: '{student_note}'. "
+        f"AI 추천 컨텍스트: {recommend_ctx}"
+    )
+    learning_guide = (
+        f"{_COUNSELING_DATA['expert_comment']} "
+        f"현재 국어 백분위 {korean_grade}%, 일일 학습 시간 {study_time}시간 기준 "
+        f"맞춤형 학습 전략을 제안합니다."
+    )
 
     return {
-        "studentId": req.studentId,
-        "reportHtml": generated_report
+        "studentId": student_id,
+        "title": title,
+        "careerAnalysis": career_analysis,
+        "learningGuide": learning_guide,
     }
+
+
+# ── POST /api/ai/report/math ───────────────────────────────────────────────────
+@router.post("/report/math")
+async def report_math(req: dict):
+    return _base_report(
+        req,
+        title="수학 메타인지 분석 리포트",
+        focus="수학 사고력 및 오답 패턴 분석",
+    )
+
+
+# ── POST /api/ai/report/writing ────────────────────────────────────────────────
+@router.post("/report/writing")
+async def report_writing(req: dict):
+    return _base_report(
+        req,
+        title="AI 기반 진로 탐색 리포트",
+        focus="언어·작문 역량 및 진로 적합성 분석",
+    )
+
+
+# ── POST /api/ai/report/premium ────────────────────────────────────────────────
+@router.post("/report/premium")
+async def report_premium(req: dict):
+    return _base_report(
+        req,
+        title="i-Route 프리미엄 통합 AI 진단 리포트",
+        focus="수학·언어·진로 종합 분석",
+    )
+
+
+# ── POST /api/ai/search ────────────────────────────────────────────────────────
+# GradeAnalysisService 에서 호출 — contexts 리스트 반환
+@router.post("/search")
+async def ai_search(req: dict):
+    query = req.get("question", "")
+    contexts = vector_search(query, k=5)
+    return {"contexts": contexts}
