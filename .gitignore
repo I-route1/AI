@@ -16,11 +16,6 @@ datasets/
 *.jsonl
 *.csv
 
-# FAISS 인덱스 (GitHub 100MB 초과)
-*.faiss
-*.pkl
-src/api/rag_db/
-
 # Distribution / packaging
 .Python
 build/
