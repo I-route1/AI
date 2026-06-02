@@ -21,12 +21,20 @@ async def predict_next_score(req: PredictionRequest):
 
     try:
         features = np.array([[req.past_score_avg, req.study_hours_per_day]])
-        predicted_score = int(model.predict(features)[0])
+        raw = model.predict(features)[0]
+        # 모델 출력이 0~1 정규화값이면 100점 척도로 역변환
+        predicted_score = int(raw * 100) if raw <= 1.0 else int(raw)
+        predicted_score = max(0, min(100, predicted_score))
 
-        if predicted_score < req.past_score_avg:
-            msg = "⚠️ 학습량 부족으로 성적 하락이 예상됩니다. 일일 학습 시간을 늘려보세요!"
+        diff = predicted_score - req.past_score_avg
+        if diff >= 1:
+            msg = "📈 현재 학습 패턴이 좋습니다! 성적 향상이 기대됩니다."
+        elif diff >= -2:
+            msg = "📊 현재 학습량으로 성적을 유지할 수 있습니다. 조금 더 노력하면 더 올릴 수 있어요."
+        elif diff >= -4:
+            msg = "⚠️ 현재 학습량으로는 소폭 하락이 예상됩니다. 학습 시간을 늘려보세요."
         else:
-            msg = "📈 현재 학습 패턴이 아주 좋습니다! 목표 달성이 코앞입니다."
+            msg = "🚨 학습량이 크게 부족합니다. 지금 바로 학습 계획을 점검하세요."
 
         return PredictionResponse(expected_score=predicted_score, message=msg)
     except Exception as e:

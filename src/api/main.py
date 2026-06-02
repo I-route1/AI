@@ -1,23 +1,30 @@
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-from fastapi import FastAPI, Query  # ✅ Query 추가
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+import json
+
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
+    def render(self, content) -> bytes:
+        return json.dumps(content, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
 import torch
 import httpx
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig  # ✅ BitsAndBytesConfig 추가
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-import re
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 from src.api.routers import counseling, predictor, writing
+from src.api.routers.rag import subject_aware_search as _subject_aware_search
 
-app = FastAPI(title="iRoute AI Server")
+app = FastAPI(title="iRoute AI Server", default_response_class=UTF8JSONResponse)
 
 app.include_router(counseling.router, prefix="/api/ai", tags=["counseling"])
 app.include_router(predictor.router, prefix="/api/ai", tags=["predictor"])
 app.include_router(writing.router, prefix="/api/writing", tags=["writing"])
 
-# ✅ 4bit 양자화 설정
+# 4bit 양자화 설정
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
@@ -25,42 +32,27 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True
 )
 
-print("📥 범용 모델 로드 중 (4bit 양자화 모드)...")
-MODEL_ID = "MLP-KTLim/llama-3-Korean-Bllossom-8B"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+BASE_MODEL_ID      = "unsloth/Meta-Llama-3.1-8B-bnb-4bit"
+WRITING_ADAPTER_ID = "i-route-ai/iroute-writing-ai"
+
+print("📥 base 모델 로드 중 (4bit)...")
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.clean_up_tokenization_spaces = False
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_ID,
     quantization_config=bnb_config,
     device_map="auto"
 )
 
-# ✅ 수학 모델 추가
-print("📥 수학 전용 모델 로드 중 (4bit 양자화 모드)...")
-MATH_MODEL_ID = "i-route-ai/iroute-math-llm-v2-16bit"
-math_tokenizer = AutoTokenizer.from_pretrained(MATH_MODEL_ID)
-math_tokenizer.pad_token = math_tokenizer.eos_token
-math_tokenizer.clean_up_tokenization_spaces = False
-math_model = AutoModelForCausalLM.from_pretrained(
-    MATH_MODEL_ID,
-    quantization_config=bnb_config,
-    device_map="auto"
-)
+print("📥 글쓰기 어댑터 로드 중...")
+base_model.load_adapter(WRITING_ADAPTER_ID, adapter_name="writing")
+print("✅ 글쓰기 어댑터 로드 완료")
 
-# RAG 로드
-DB_DIR = os.path.join(os.path.dirname(__file__), "rag_db")
-embeddings = HuggingFaceEmbeddings(
-    model_name="jhgan/ko-sroberta-multitask",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True}
-)
-try:
-    vector_db = FAISS.load_local(DB_DIR, embeddings, allow_dangerous_deserialization=True)
-    print("✅ RAG DB 로드 완료!")
-except:
-    vector_db = None
-    print("⚠️ RAG DB 없음, 스킵")
+# writing.py에서 app.state로 접근
+app.state.model     = base_model
+app.state.tokenizer = tokenizer
 
 
 def get_student_weakness_from_java(student_id: str, subject: str):
@@ -76,80 +68,92 @@ def get_student_weakness_from_java(student_id: str, subject: str):
         return []
 
 
-def get_rag_context(subject: str, query: str) -> str:
-    if not vector_db:
-        return ""
-    docs = vector_db.similarity_search(f"{subject} {query}", k=2)
-    return "\n".join([re.sub(r'<[^>]*>', '', doc.page_content) for doc in docs])
+_SUBJECT_DEFAULT_CONCEPT: dict[str, str] = {
+    "수학":   "방정식과 함수 기본 개념",
+    "영어":   "독해와 어법 기본",
+    "국어":   "문학과 비문학 독해",
+    "과학":   "기본 과학 개념",
+    "사회":   "사회 기본 개념",
+    "한국사": "한국사 주요 사건",
+}
+
+_SUBJECT_STRATEGY: dict[str, list[str]] = {
+    "수학":   ["교과서 개념 정리 및 공식 확인", "관련 기출 예제 5문항 풀이", "오답 원인 분석 후 재풀이", "유사 문제 추가 풀이로 확인"],
+    "영어":   ["핵심 어법 규칙 정리", "관련 지문 구문 분석", "어휘 정리 및 암기", "유형별 문제 반복 풀이"],
+    "국어":   ["지문 구조 파악 훈련", "핵심 주장 및 근거 추출 연습", "어휘·표현 정리", "유사 지문 독해 연습"],
+    "과학":   ["개념 원리 이해 및 정리", "관련 실험·현상 사례 확인", "공식·법칙 적용 연습", "단원 마무리 문제 풀이"],
+    "사회":   ["핵심 개념·용어 정리", "관련 사례 및 사료 확인", "개념 간 연관성 파악", "기출 문제 풀이"],
+    "한국사": ["시대적 흐름 파악", "주요 사건·인물 정리", "사료 해석 연습", "연표 작성 후 복습"],
+}
 
 
-# ✅ Query 파라미터 명시적 선언
+async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
+    """Ollama llama3.1으로 짧은 분석 생성. 실패/타임아웃 시 None 반환."""
+    import logging
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "llama3.1:latest",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"num_predict": 150, "temperature": 0.4},
+                },
+                timeout=timeout,
+            )
+            if r.status_code == 200:
+                return r.json().get("response", "").strip()
+            logging.warning(f"[Ollama] status {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        logging.warning(f"[Ollama] 연결 실패: {e}")
+    return None
+
+
 @app.post("/api/ai/report/subject-recommend")
-def generate_subject_recommendation(
+async def generate_subject_recommendation(
         student_id: str = Query(...),
-        subject: str = Query(...)
+        subject: str = Query(...),
+        concept_tag: str = Query(default=None),
 ):
-    weakness_data = get_student_weakness_from_java(student_id, subject)
-    if not weakness_data:
-        return {"status": "error", "message": "데이터 없음"}
-
-    concept_query = weakness_data[0].get("conceptTag")
-    retrieved_questions = get_rag_context(subject, concept_query)
-
-    # ✅ 과목별 모델 라우팅
-    if subject == "수학":
-        active_tokenizer = math_tokenizer
-        active_model = math_model
-        prompt = f"""### 지시사항:
-    당신은 수학 전문가입니다. 아래 [학습 자료]만 사용하여 개념을 설명하세요.
-
-    [학습 자료]:
-    {retrieved_questions}
-
-    ### 개념 요약:"""
+    # concept 결정: 직접 전달 → Java 백엔드 → 과목 기본값 순
+    if concept_tag:
+        concept_query = concept_tag
     else:
-        active_tokenizer = tokenizer
-        active_model = model
-        prompt = f"""### 지시사항:
-    당신은 {subject} 전문가입니다. 아래 [학습 자료]만 사용하여 개념을 설명하세요.
-
-    [학습 자료]:
-    {retrieved_questions}
-
-    ### 개념 요약:"""
-
-    inputs = active_tokenizer(prompt, return_tensors="pt").to("cuda")
-    with torch.no_grad():
-        outputs = active_model.generate(
-            **inputs,
-            max_new_tokens=300,
-            temperature=0.3,
-            do_sample=True,
-            repetition_penalty=1.2,
-            pad_token_id=active_tokenizer.eos_token_id
+        weakness_data = get_student_weakness_from_java(student_id, subject)
+        concept_query = (
+            weakness_data[0].get("conceptTag")
+            if weakness_data else
+            _SUBJECT_DEFAULT_CONCEPT.get(subject, f"{subject} 기본 개념")
         )
 
-    result_text = active_tokenizer.decode(outputs[0], skip_special_tokens=True)
-    raw_text = result_text.split("개념 요약:")[-1].strip()
+    # RAG 검색
+    rag_docs = _subject_aware_search(subject, concept_query, k=3)
+    rag_text = "\n".join(f"  • {d}" for d in rag_docs if d and "오류" not in d)
 
-    def refine_text(text: str) -> str:
-        # A. HTML 태그 제거 (예: <table... 등)
-        text = re.sub(r'<[^>]*>', '', text)
+    # Rule-based 리포트
+    steps = _SUBJECT_STRATEGY.get(subject, [
+        "개념 정리 및 확인", "관련 예제 풀이", "오답 분석", "추가 문제로 실력 확인"
+    ])
+    strategy = "\n".join(f"{i+1}단계 — {s}" for i, s in enumerate(steps))
 
-        # B. 너무 많은 줄바꿈을 2개로 통일
-        text = re.sub(r'\n{3,}', '\n\n', text)
+    report = f"[{subject} 취약 개념 학습 가이드]\n\n● 집중 학습 개념: {concept_query}\n"
+    if rag_text:
+        report += f"\n[관련 학습 자료]\n{rag_text}\n"
+    report += f"\n[학습 전략]\n{strategy}"
 
-        # C. 모델이 생성한 불필요한 마크다운 문법이나 텍스트 정리
-        # (예: "###" 문구나 불필요한 공백 제거)
-        text = text.replace("###", "").replace("  ", " ").strip()
-
-        return text
-
-    clean_text = re.sub(r'<[^>]*>', '', raw_text).strip()
+    # LLM 심층 분석 추가
+    prompt = (
+        f"{subject} 과목에서 '{concept_query}' 개념을 어려워하는 학생에게 "
+        f"이 개념의 핵심 포인트와 효과적인 학습 방법을 2~3문장으로 한국어로 답해주세요."
+    )
+    llm_insight = await _ollama_analyze(prompt)
+    if llm_insight:
+        report += f"\n\n[AI 개념 분석]\n{llm_insight}"
 
     return {
         "studentId": student_id,
         "subject": subject,
         "targetConcept": concept_query,
-        "aiRecommendationReport": clean_text
+        "aiRecommendationReport": report,
     }

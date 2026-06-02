@@ -1,7 +1,9 @@
 import math
+import re
+import torch
 from typing import List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -177,29 +179,114 @@ def _theta_to_level(theta: float) -> str:
     return "최상"
 
 
+# ──────────────── LLM 피드백 생성 ────────────────
+
+def _llm_feedback(request: Request, question: str, model_answer: str,
+                  user_answer: str, missing: List[str], final_score: int) -> tuple[str, str]:
+    """writing 어댑터로 LLM 피드백 생성. 실패 시 규칙 기반 fallback."""
+    try:
+        model     = request.app.state.model
+        tokenizer = request.app.state.tokenizer
+        model.set_adapter("writing")
+
+        missing_hint = f"\n누락된 키워드: {', '.join(missing[:3])}" if missing else ""
+        prompt = (
+            "### Instruction:\n"
+            "다음 서술형 문제에 대한 학생 답안을 평가하고 구체적인 피드백을 작성하세요.\n\n"
+            f"[문제]: {question}\n"
+            f"[모범 답안]: {model_answer}{missing_hint}\n\n"
+            "### Input:\n"
+            f"{user_answer[:700]}\n\n"
+            "### Response:\n"
+        )
+
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to("cuda")
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=150,
+                temperature=0.4,
+                do_sample=True,
+                repetition_penalty=1.3,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        feedback = generated.split("### Response:")[-1].strip()
+        # 마크다운 헤더 제거
+        feedback = re.sub(r'#{1,4}\s*\w*:?\s*', '', feedback)
+        feedback = re.sub(r'\s+', ' ', feedback).strip()
+        # 중복 문장 제거
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', feedback) if s.strip()]
+        seen_s: set[str] = set()
+        unique = []
+        for s in sentences:
+            key = re.sub(r'\s+', '', s)
+            if key not in seen_s:
+                seen_s.add(key)
+                unique.append(s)
+        feedback = ' '.join(unique)
+
+        if final_score >= 80:
+            score_feedback = "우수한 답변입니다."
+        elif final_score >= 60:
+            score_feedback = "양호한 답변입니다."
+        elif final_score >= 40:
+            score_feedback = "미흡한 답변입니다."
+        else:
+            score_feedback = "부족한 답변입니다."
+
+        return feedback, score_feedback
+
+    except Exception:
+        return None, None
+
+
 # ──────────────── Endpoints ────────────────
 
 @router.post("/evaluate", response_model=EvaluateResponse)
-async def evaluate(req: EvaluateRequest):
+async def evaluate(request: Request, req: EvaluateRequest):
     matched, missing = _match_keywords(req.user_answer, req.keywords)
     kw_score = _keyword_score(matched, req.keywords)
     length_score = _length_score(req.user_answer, req.model_answer)
 
-    raw_score = int(kw_score * 0.7 + length_score * 0.3) if req.keywords else length_score
+    raw_score  = int(kw_score * 0.7 + length_score * 0.3) if req.keywords else length_score
     final_score = min(100, max(0, raw_score))
 
     if final_score >= 80:
-        feedback_type, feedback = "EXCELLENT", "핵심 내용을 잘 파악하고 있습니다."
-        score_feedback = "우수한 답변입니다."
+        feedback_type = "EXCELLENT"
     elif final_score >= 60:
-        feedback_type, feedback = "GOOD", "주요 내용을 포함했으나 보완이 필요합니다."
-        score_feedback = "양호한 답변입니다."
+        feedback_type = "GOOD"
     elif final_score >= 40:
-        feedback_type, feedback = "NEEDS_IMPROVEMENT", "핵심 키워드가 부족합니다. 지문을 다시 읽어보세요."
-        score_feedback = "미흡한 답변입니다."
+        feedback_type = "NEEDS_IMPROVEMENT"
     else:
-        feedback_type, feedback = "POOR", "답변이 너무 짧거나 핵심 내용이 빠져 있습니다."
-        score_feedback = "부족한 답변입니다."
+        feedback_type = "POOR"
+
+    if final_score >= 80:
+        feedback_type = "EXCELLENT"
+    elif final_score >= 60:
+        feedback_type = "GOOD"
+    elif final_score >= 40:
+        feedback_type = "NEEDS_IMPROVEMENT"
+    else:
+        feedback_type = "POOR"
+
+    # LLM 피드백 시도 → 실패 시 규칙 기반 fallback
+    llm_fb, score_feedback = _llm_feedback(
+        request, req.question_text, req.model_answer, req.user_answer, missing, final_score
+    )
+    if llm_fb:
+        feedback = llm_fb
+    else:
+        feedback = {
+            "EXCELLENT": "핵심 내용을 잘 파악하고 있습니다.",
+            "GOOD":      "주요 내용을 포함했으나 보완이 필요합니다.",
+            "NEEDS_IMPROVEMENT": "핵심 키워드가 부족합니다. 지문을 다시 읽어보세요.",
+            "POOR":      "답변이 너무 짧거나 핵심 내용이 빠져 있습니다.",
+        }[feedback_type]
+        score_feedback = {
+            "EXCELLENT": "우수한 답변입니다.", "GOOD": "양호한 답변입니다.",
+            "NEEDS_IMPROVEMENT": "미흡한 답변입니다.", "POOR": "부족한 답변입니다.",
+        }[feedback_type]
 
     improvement = (
         f"누락 키워드 '{', '.join(missing[:3])}' 를 답변에 포함해보세요."
