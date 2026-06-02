@@ -10,6 +10,8 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 import re
 
 from src.api.routers import counseling, predictor, rag
+from src.api.routers.rag import subject_aware_search as _subject_aware_search
+from src.api import model_registry
 
 app = FastAPI(title="iRoute AI Server")
 
@@ -62,6 +64,13 @@ except:
     vector_db = None
     print("⚠️ RAG DB 없음, 스킵")
 
+# 모델을 registry에 등록 — counseling.py에서 LLM 강화에 사용
+model_registry.register('model', model)
+model_registry.register('tokenizer', tokenizer)
+model_registry.register('math_model', math_model)
+model_registry.register('math_tokenizer', math_tokenizer)
+print("✅ model_registry 등록 완료")
+
 
 def get_student_weakness_from_java(student_id: str, subject: str):
     try:
@@ -77,10 +86,9 @@ def get_student_weakness_from_java(student_id: str, subject: str):
 
 
 def get_rag_context(subject: str, query: str) -> str:
-    if not vector_db:
-        return ""
-    docs = vector_db.similarity_search(f"{subject} {query}", k=2)
-    return "\n".join([re.sub(r'<[^>]*>', '', doc.page_content) for doc in docs])
+    # subject_aware_search: 과목 필터 + LaTeX 제거 적용
+    docs = _subject_aware_search(subject, query, k=3)
+    return "\n".join(docs)
 
 
 # ✅ Query 파라미터 명시적 선언

@@ -1,6 +1,7 @@
 import httpx
 
 JAVA_BACKEND_URL = "http://localhost:8080/api/wrong-answer/ai-pipeline"
+# JAVA_BACKEND_URL = "https://demystify-handcuff-protegee.ngrok-free.dev/api/wrong-answer/ai-pipeline"
 
 def get_student_weakness_from_java(student_id: str, subject: str):
     """
