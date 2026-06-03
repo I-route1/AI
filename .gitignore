@@ -11,6 +11,13 @@ raw_data/
 processed_data/
 datasets/
 
+# 대용량 모델/벡터DB 제외
+train/
+src/api/rag_db/
+venv_blackwell/
+*.faiss
+*.safetensors
+
 # 대용량 파일 확장자 제외
 *.json
 *.jsonl
