@@ -313,52 +313,56 @@ def vector_search(query: str, k: int = 3) -> list[str]:
 
 def subject_aware_search(subject: str, query: str, k: int = 3) -> list[str]:
     """
-    1. subject 키워드로 쿼리 보강 (fetch_k = k*10 으로 충분히 확보)
-    2. 경로 패턴 → 개념 키워드 순으로 과목 필터링
-    3. LaTeX·HTML 제거 후 k개 반환
-    크로스 과목 오염 방지: 과목 필터 실패 시 빈 리스트 반환.
+    1. 개요 쿼리(핵심 개념 및 자주 출제되는 단원) → ConceptMap 과목 샘플 즉시 반환
+    2. ConceptMap 키워드 직접 매핑 — 히트가 있으면 즉시 반환 (FAISS 혼합 없음)
+    3. ConceptMap 미스 → FAISS 벡터 검색 + 과목 필터
+    4. FAISS도 결과 없으면 ConceptMap에서 해당 과목 샘플 반환 (fallback)
     """
-    if _index is None or not _doc_texts:
-        return []
-    try:
-        # 개념 키워드 직접 매핑 우선 조회
-        concept_hits = _concept_map_search(subject, query, k)
-        if len(concept_hits) >= k:
-            return concept_hits
+    # ── 1. 개요 쿼리 감지: 개념 없이 과목만 선택한 경우 ─────────────────────────
+    if "핵심 개념 및 자주 출제되는 단원" in query:
+        overview = [v for keys, v in _CONCEPT_MAP.items() if keys[0] == subject]
+        return overview[:k]
 
-        enriched_query = f"{subject} 교육과정 {query} 개념 학습"
-        vec = _encode(enriched_query).astype(np.float32)
-        faiss.normalize_L2(vec)
-        fetch_k = min(k * 10, len(_doc_texts))
-        _, indices = _index.search(vec, fetch_k)
-        candidates = [_doc_texts[i] for i in indices[0] if 0 <= i < len(_doc_texts)]
+    # ── 2. ConceptMap 우선 ─────────────────────────────────────────────────────
+    concept_hits = _concept_map_search(subject, query, k)
+    if concept_hits:
+        return concept_hits[:k]
 
-        filtered = _filter_by_subject(candidates, subject)
+    # ── 2. FAISS fallback ──────────────────────────────────────────────────────
+    if _index is not None and _doc_texts:
+        try:
+            enriched_query = f"{subject} 교육과정 {query} 개념 학습"
+            vec = _encode(enriched_query).astype(np.float32)
+            faiss.normalize_L2(vec)
+            fetch_k = min(k * 10, len(_doc_texts))
+            _, indices = _index.search(vec, fetch_k)
+            candidates = [_doc_texts[i] for i in indices[0] if 0 <= i < len(_doc_texts)]
 
-        # 쿼리 키워드 기반 재정렬 — 핵심 개념어가 포함된 문서 우선
-        query_words = set(re.sub(r'\s+', ' ', query).split())
-        def _kw_score(doc: str) -> int:
-            return sum(1 for w in query_words if len(w) > 1 and w in doc)
-        filtered = sorted(filtered, key=_kw_score, reverse=True)
+            filtered = _filter_by_subject(candidates, subject)
 
-        cleaned = []
-        seen = set()
-        for doc in filtered:
-            c = _extract_content(doc)
-            if len(c) > 30 and c not in seen:
-                cleaned.append(c)
-                seen.add(c)
-            if len(cleaned) >= k:
-                break
+            query_words = set(re.sub(r'\s+', ' ', query).split())
+            def _kw_score(doc: str) -> int:
+                return sum(1 for w in query_words if len(w) > 1 and w in doc)
+            filtered = sorted(filtered, key=_kw_score, reverse=True)
 
-        # 개념 맵 히트가 있으면 앞에 추가하고 k개로 맞춤
-        if concept_hits:
-            combined = concept_hits + [c for c in cleaned if c not in concept_hits]
-            return combined[:k]
+            cleaned = []
+            seen = set()
+            for doc in filtered:
+                c = _extract_content(doc)
+                if len(c) > 30 and c not in seen:
+                    cleaned.append(c)
+                    seen.add(c)
+                if len(cleaned) >= k:
+                    break
 
-        return cleaned  # 과목 매칭 없으면 [] — 폴백 없음
-    except Exception as e:
-        return [f"검색 오류: {str(e)}"]
+            if cleaned:
+                return cleaned
+        except Exception as e:
+            return [f"검색 오류: {str(e)}"]
+
+    # ── 3. ConceptMap 과목 샘플 (개념 미입력 등 완전 미스 시 fallback) ──────────
+    overview = [v for keys, v in _CONCEPT_MAP.items() if keys[0] == subject]
+    return overview[:k]
 
 
 # ── POST /api/rag/search ───────────────────────────────────────────────────────
