@@ -1,7 +1,18 @@
 import os
+import sys
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# Windows 콘솔이 cp949 등 비-UTF8 인코딩일 때 이모지/한글 print가 UnicodeEncodeError로
+# 서버 기동 자체를 죽이는 것을 방지.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import json
 
@@ -14,58 +25,72 @@ class UTF8JSONResponse(JSONResponse):
 import torch
 import httpx
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel
 
-from src.api.routers import counseling, predictor, writing
+from src.api.routers import counseling, predictor, writing, rag
 from src.api.routers.rag import subject_aware_search as _subject_aware_search
+from src.api.java_client import get_student_weakness_from_java
 
 app = FastAPI(title="iRoute AI Server", default_response_class=UTF8JSONResponse)
+
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:8080,http://localhost:3000")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(counseling.router, prefix="/api/ai", tags=["counseling"])
 app.include_router(predictor.router, prefix="/api/ai", tags=["predictor"])
 app.include_router(writing.router, prefix="/api/writing", tags=["writing"])
+app.include_router(rag.router, prefix="/api/rag", tags=["rag"])
 
 # 4bit 양자화 설정
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_compute_dtype=torch.bfloat16,
     bnb_4bit_use_double_quant=True
 )
 
-BASE_MODEL_ID      = "unsloth/Meta-Llama-3.1-8B-bnb-4bit"
-WRITING_ADAPTER_ID = "i-route-ai/iroute-writing-ai"
+# 베이스 모델 하나(Qwen3-8B)에 수학/글쓰기 어댑터를 둘 다 올려 set_adapter()로 갈아끼우며 서빙한다.
+# 예전엔 수학=Gemma4, 글쓰기=원격 Llama3.1 어댑터로 서로 다른 베이스라 8B 모델 두 개를 동시에
+# 띄워야 했는데(VRAM 부족으로 OOM), 두 어댑터를 같은 베이스로 재학습해서 하나로 합침.
+BASE_MODEL_ID      = "unsloth/Qwen3-8B-unsloth-bnb-4bit"
+MATH_ADAPTER_PATH  = "train/math_adapter_qwen"
+WRITING_ADAPTER_PATH = "train/writing_adapter_qwen_weighted"
+MATH_SYSTEM_PROMPT = "당신은 수학 전문 교사입니다. 학생의 수학 문제에 대해 정확한 풀이와 해설을 제공하세요."
 
 print("📥 base 모델 로드 중 (4bit)...")
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.clean_up_tokenization_spaces = False
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_ID,
     quantization_config=bnb_config,
-    device_map="auto"
+    device_map={"": 0},
 )
 
+print("📥 수학 어댑터 로드 중...")
+base_model = PeftModel.from_pretrained(base_model, MATH_ADAPTER_PATH, adapter_name="math")
+print("✅ 수학 어댑터 로드 완료")
+
 print("📥 글쓰기 어댑터 로드 중...")
-base_model.load_adapter(WRITING_ADAPTER_ID, adapter_name="writing")
+base_model.load_adapter(WRITING_ADAPTER_PATH, adapter_name="writing")
 print("✅ 글쓰기 어댑터 로드 완료")
 
-# writing.py에서 app.state로 접근
+base_model.set_adapter("math")
+
 app.state.model     = base_model
 app.state.tokenizer = tokenizer
-
-
-def get_student_weakness_from_java(student_id: str, subject: str):
-    try:
-        with httpx.Client() as client:
-            response = client.get(
-                "http://localhost:8080/api/wrong-answer/ai-pipeline",
-                params={"studentId": student_id, "subject": subject},
-                timeout=5.0
-            )
-            return response.json() if response.status_code == 200 else []
-    except:
-        return []
+# math/writing 라우터가 같은 베이스 모델을 공유 - 호출 전 각자 set_adapter()로 전환한다.
+app.state.writing_model     = base_model
+app.state.writing_tokenizer = tokenizer
 
 
 _SUBJECT_DEFAULT_CONCEPT: dict[str, str] = {
@@ -88,7 +113,6 @@ _SUBJECT_STRATEGY: dict[str, list[str]] = {
 
 
 async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
-    """Ollama llama3.1으로 짧은 분석 생성. 실패/타임아웃 시 None 반환."""
     import logging
     try:
         async with httpx.AsyncClient() as client:
@@ -110,13 +134,45 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
     return None
 
 
+def _math_concept_explain(concept_query: str) -> str | None:
+    """수학 어댑터로 개념 설명 생성. 실패 시 None(호출부에서 Ollama로 fallback)."""
+    import logging
+    try:
+        model     = app.state.model
+        tokenizer = app.state.tokenizer
+        model.set_adapter("math")
+
+        messages = [
+            {"role": "system", "content": MATH_SYSTEM_PROMPT},
+            {"role": "user", "content": f"'{concept_query}' 개념의 핵심 포인트를 학생에게 설명해주세요."},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to("cuda")
+        input_len = inputs["input_ids"].shape[-1]
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=200,
+                temperature=0.3,
+                do_sample=True,
+                repetition_penalty=1.2,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+    except Exception as e:
+        logging.warning(f"[수학 어댑터] 생성 실패: {e}")
+        return None
+
+
 @app.post("/api/ai/report/subject-recommend")
 async def generate_subject_recommendation(
         student_id: str = Query(...),
         subject: str = Query(...),
         concept_tag: str = Query(default=None),
 ):
-    # concept 결정: 직접 전달 → Java 백엔드 → 과목 기본값 순
     if concept_tag:
         concept_query = concept_tag
     else:
@@ -127,11 +183,9 @@ async def generate_subject_recommendation(
             _SUBJECT_DEFAULT_CONCEPT.get(subject, f"{subject} 기본 개념")
         )
 
-    # RAG 검색
     rag_docs = _subject_aware_search(subject, concept_query, k=3)
     rag_text = "\n".join(f"  • {d}" for d in rag_docs if d and "오류" not in d)
 
-    # Rule-based 리포트
     steps = _SUBJECT_STRATEGY.get(subject, [
         "개념 정리 및 확인", "관련 예제 풀이", "오답 분석", "추가 문제로 실력 확인"
     ])
@@ -142,12 +196,17 @@ async def generate_subject_recommendation(
         report += f"\n[관련 학습 자료]\n{rag_text}\n"
     report += f"\n[학습 전략]\n{strategy}"
 
-    # LLM 심층 분석 추가
-    prompt = (
-        f"{subject} 과목에서 '{concept_query}' 개념을 어려워하는 학생에게 "
-        f"이 개념의 핵심 포인트와 효과적인 학습 방법을 2~3문장으로 한국어로 답해주세요."
-    )
-    llm_insight = await _ollama_analyze(prompt)
+    llm_insight = None
+    if subject == "수학":
+        llm_insight = _math_concept_explain(concept_query)
+
+    if not llm_insight:
+        prompt = (
+            f"{subject} 과목에서 '{concept_query}' 개념을 어려워하는 학생에게 "
+            f"이 개념의 핵심 포인트와 효과적인 학습 방법을 2~3문장으로 한국어로 답해주세요."
+        )
+        llm_insight = await _ollama_analyze(prompt)
+
     if llm_insight:
         report += f"\n\n[AI 개념 분석]\n{llm_insight}"
 

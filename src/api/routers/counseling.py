@@ -1,8 +1,38 @@
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from src.api.routers.rag import subject_aware_search, vector_search, _SUBJECT_KEYWORDS
 
 router = APIRouter()
+
+# 과목별 기본 검색어 (recommendContext 없을 때 RAG 검색 폴백용)
+_DEFAULT_QUERY = {
+    "수학":   "방정식 함수 기본 개념",
+    "영어":   "구문 독해 어법 기본",
+    "국어":   "문학 독해 언어 능력",
+    "과학":   "물리 화학 생물 기본 개념",
+    "사회":   "사회 역사 지리 기본 개념",
+    "한국사": "한국사 시대별 핵심 사건",
+}
+
+# 과목별 오답 유형 (수학 외 과목에서 "계산 실수" 대신 쓸 표현)
+_MISTAKE_TYPES = {
+    "수학":   "계산 실수 / 개념 미이해 / 응용력 부족",
+    "영어":   "어휘·문법 실수 / 구문 해석 오류 / 추론력 부족",
+    "국어":   "어휘력 부족 / 지문 구조 파악 실패 / 선지 함정 오독",
+    "과학":   "개념 혼동 / 단위·계산 실수 / 실험 해석 오류",
+    "사회":   "암기 부족 / 개념 간 혼동 / 자료 해석 오류",
+    "한국사": "연대·인물 암기 부족 / 사건 인과관계 혼동 / 사료 해석 오류",
+}
+
+# 과목별 백분위 구간(상/중/하)에 따른 학습 전략
+_STRATEGY = {
+    "수학":   {"high": "킬러문항 집중 훈련, 시간 단축 연습", "mid": "오답 유형 분류 후 유형별 집중 풀이", "low": "교과서 개념부터 순서대로 재정리"},
+    "영어":   {"high": "고난도 빈칸·순서 유형 반복", "mid": "구문 독해 → 유형별 문제풀이 순서로", "low": "핵심 문법 5개 + 단어 20개/일 암기"},
+    "국어":   {"high": "고전 문학 + 현대소설 심층 독해", "mid": "비문학 지문 구조 파악 훈련", "low": "짧은 지문 요약 훈련으로 독해력 향상"},
+    "과학":   {"high": "실험·탐구 서술형 고난도 문항 반복", "mid": "단원별 핵심 개념 정리 후 응용 문제 풀이", "low": "교과서 개념 정의부터 순서대로 재학습"},
+    "사회":   {"high": "시사 이슈 연계 자료 해석 심화 훈련", "mid": "개념 간 비교표 작성 후 기출 문제 풀이", "low": "핵심 용어 암기 + 단원 요약 정리"},
+    "한국사": {"high": "사료 분석형 고난도 문항 반복", "mid": "시대별 흐름표 정리 후 기출 문제 풀이", "low": "연표 암기 + 시대별 핵심 사건 정리"},
+}
 
 
 async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
@@ -92,6 +122,57 @@ def _math_report(req: dict) -> dict:
     }
 
 
+def _subject_report(subject: str, req: dict) -> dict:
+    """전 과목 공용 메타인지 분석 리포트 (수학 리포트와 동일한 형식을 과목별로 일반화)."""
+    student_id     = req.get("studentId", "")
+    percentile     = float(req.get("currentKoreanGrade") or 50)
+    study_hours    = float(req.get("studyTime") or 1)
+    student_note   = req.get("studentNote") or ""
+    recommend_ctx  = req.get("recommendContext") or ""
+    feedback       = req.get("instructorFeedback") or ""
+
+    level   = _level_label(percentile)
+    stamina = _study_intensity(study_hours)
+    tier    = "high" if percentile >= 75 else "mid" if percentile >= 50 else "low"
+
+    rag_docs = subject_aware_search(subject, recommend_ctx or _DEFAULT_QUERY.get(subject, subject), k=3)
+    rag_text = "\n".join(f"  • {d[:120]}" for d in rag_docs if d and "오류" not in d)
+
+    career_analysis = (
+        f"[{subject} 사고력 및 오답 패턴 분석]\n\n"
+        f"● 현재 학업 수준: {level} (백분위 {percentile:.0f}%)\n"
+        f"● 학습 강도: {stamina} (일 {study_hours:.1f}시간)\n"
+    )
+    if student_note:
+        career_analysis += f"● 학습 특성: {student_note}\n"
+    if feedback:
+        career_analysis += f"● 최근 강사 피드백: {feedback}\n"
+    if recommend_ctx:
+        career_analysis += f"\n[취약 개념 집중 분석]\n{recommend_ctx}\n"
+    if rag_text:
+        career_analysis += f"\n[관련 학습 자료 검색 결과]\n{rag_text}\n"
+
+    mistake_types = _MISTAKE_TYPES.get(subject, "개념 미이해 / 적용력 부족 / 실수")
+    strategy      = _STRATEGY.get(subject, {}).get(tier, "기본 개념 정리 후 문제풀이 반복")
+
+    learning_guide = (
+        f"[{subject} 맞춤 학습 전략]\n\n"
+        f"1단계 — 오답 유형 분류: {mistake_types}로 구분 후 원인별 대응\n"
+        f"2단계 — 취약 개념 집중: '{recommend_ctx or '핵심 개념'}' 단원 기출 10문항 반복\n"
+        f"3단계 — 오답 노트 작성: 틀린 문제를 다시 풀어 풀이 과정을 직접 설명\n"
+        f"4단계 — 실력 점검: {strategy}\n\n"
+        f"현재 {level} 기준 권장 일일 학습: "
+        f"{f'{subject} 1.5시간 + 오답 정리 30분' if tier == 'high' else '개념 1시간 + 문제풀이 1시간 + 복습 30분'}"
+    )
+
+    return {
+        "studentId": student_id,
+        "title": f"{subject} 메타인지 분석 리포트",
+        "careerAnalysis": career_analysis,
+        "learningGuide": learning_guide,
+    }
+
+
 def _writing_report(req: dict) -> dict:
     student_id    = req.get("studentId", "")
     percentile    = float(req.get("currentKoreanGrade") or 50)
@@ -102,8 +183,8 @@ def _writing_report(req: dict) -> dict:
 
     level = _level_label(percentile)
 
-    # RAG로 국어 관련 학습 자료 검색 (과목 필터 적용)
-    rag_docs  = subject_aware_search("국어", student_note or "문학 독해 언어 능력", k=3)
+    # RAG로 국어 관련 학습 자료 검색 (과목 필터 적용) — 다른 과목 리포트와 동일하게 recommendContext 우선
+    rag_docs  = subject_aware_search("국어", recommend_ctx or _DEFAULT_QUERY["국어"], k=3)
     rag_text  = "\n".join(f"  • {d[:120]}" for d in rag_docs if d and "오류" not in d)
 
     career_analysis = (
@@ -118,7 +199,7 @@ def _writing_report(req: dict) -> dict:
     if recommend_ctx:
         career_analysis += f"\n[진로 추천 근거]\n{recommend_ctx}\n"
     if rag_text:
-        career_analysis += f"\n[관련 진로·학습 자료]\n{rag_text}\n"
+        career_analysis += f"\n[관련 학습 자료 검색 결과]\n{rag_text}\n"
 
     if percentile >= 80:
         career_path = "언어·미디어 계열 (기자, 작가, 출판 편집자, 광고 카피라이터)"
@@ -274,6 +355,27 @@ async def report_premium(req: dict):
     llm_insight = await _ollama_analyze(prompt)
     if llm_insight:
         result["careerAnalysis"] += f"\n\n[AI 우선순위 행동 제안]\n{llm_insight}"
+    return result
+
+
+@router.post("/report/{subject}")
+async def report_subject(subject: str, req: dict):
+    """수학/국어/프리미엄 외 과목(영어·과학·사회·한국사)의 메타인지 분석 리포트.
+    /report/math, /report/writing, /report/premium은 위에 먼저 등록되어 있어 우선 매칭됨."""
+    if subject not in _SUBJECT_KEYWORDS:
+        raise HTTPException(status_code=404, detail=f"지원하지 않는 과목입니다: {subject}")
+
+    result = _subject_report(subject, req)
+    concept = req.get("recommendContext", "").strip()
+    if concept:
+        prompt = (
+            f"한국 중고등학생이 {subject} '{concept}' 개념을 어려워합니다. "
+            f"이 개념에서 학생들이 가장 자주 하는 핵심 실수 1가지와 "
+            f"그것을 극복하는 구체적인 학습 전략을 2~3문장으로 간결하게 한국어로 답해주세요."
+        )
+        llm_insight = await _ollama_analyze(prompt)
+        if llm_insight:
+            result["careerAnalysis"] += f"\n\n[AI 개념 심층 분석]\n{llm_insight}"
     return result
 
 

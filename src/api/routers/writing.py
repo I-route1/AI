@@ -183,24 +183,35 @@ def _theta_to_level(theta: float) -> str:
 
 def _llm_feedback(request: Request, question: str, model_answer: str,
                   user_answer: str, missing: List[str], final_score: int) -> tuple[str, str]:
-    """writing 어댑터로 LLM 피드백 생성. 실패 시 규칙 기반 fallback."""
+    """글쓰기 전용 모델(Qwen3-8B + writing 어댑터)로 LLM 피드백 생성. 실패 시 규칙 기반 fallback."""
     try:
-        model     = request.app.state.model
-        tokenizer = request.app.state.tokenizer
+        model     = request.app.state.writing_model
+        tokenizer = request.app.state.writing_tokenizer
         model.set_adapter("writing")
 
         missing_hint = f"\n누락된 키워드: {', '.join(missing[:3])}" if missing else ""
-        prompt = (
-            "### Instruction:\n"
-            "다음 서술형 문제에 대한 학생 답안을 평가하고 구체적인 피드백을 작성하세요.\n\n"
-            f"[문제]: {question}\n"
-            f"[모범 답안]: {model_answer}{missing_hint}\n\n"
-            "### Input:\n"
-            f"{user_answer[:700]}\n\n"
-            "### Response:\n"
+        messages = [
+            {
+                "role": "system",
+                "content": "다음 서술형 문제에 대한 학생 답안을 평가하고 구체적인 피드백을 작성하세요.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"[문제]: {question}\n"
+                    f"[모범 답안]: {model_answer}{missing_hint}\n\n"
+                    f"[학생 답안]: {user_answer[:700]}"
+                ),
+            },
+        ]
+        # enable_thinking=False: 학습 데이터에 <think> 블록이 전혀 없어서, 켜두면
+        # 모델이 습관적으로 빈 사고 블록을 먼저 내보내며 파인튜닝된 동작이 어긋남.
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
 
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to("cuda")
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=896).to("cuda")
+        input_len = inputs["input_ids"].shape[-1]
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
@@ -210,8 +221,9 @@ def _llm_feedback(request: Request, question: str, model_answer: str,
                 repetition_penalty=1.3,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        feedback = generated.split("### Response:")[-1].strip()
+        feedback = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        # 혹시 남아있을 수 있는 사고 블록 제거 (enable_thinking=False로 대부분 방지되지만 방어적으로)
+        feedback = re.sub(r'<think>.*?</think>', '', feedback, flags=re.DOTALL).strip()
         # 마크다운 헤더 제거
         feedback = re.sub(r'#{1,4}\s*\w*:?\s*', '', feedback)
         feedback = re.sub(r'\s+', ' ', feedback).strip()
