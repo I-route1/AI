@@ -58,10 +58,43 @@ class HailoPoseEstimator:
 
         return self.decode_keypoints(raw_outputs)
 
+    def describe_outputs(self) -> str:
+        """.hef가 내보내는 출력 텐서의 이름/shape/포맷을 사람이 읽을 수 있게 정리.
+
+        decode_keypoints()를 구현하려면 먼저 이 정보가 필요하다. 출력이 어떤
+        형태인지에 따라 후처리가 완전히 달라지기 때문이다:
+          - NMS까지 포함해 컴파일된 .hef  -> 검출 결과가 바로 나와 디코딩이 거의 불필요
+          - raw 텐서로 컴파일된 .hef      -> DFL 디스트리뷰션 디코딩 + NMS를 직접 해야 함
+        Pi5에서 아래로 확인한다:
+            python -c "from pathlib import Path; from rpi.pose_hailo import HailoPoseEstimator; \
+                       print(HailoPoseEstimator(Path('rpi/yolov8_pose.hef')).describe_outputs())"
+        """
+        lines = [f"input : {self.input_info.name}  shape={self.input_info.shape}"]
+        for info in self.output_infos:
+            fmt = getattr(getattr(info, "format", None), "type", None)
+            lines.append(f"output: {info.name}  shape={info.shape}"
+                         + (f"  format={fmt}" if fmt is not None else ""))
+        lines.append(f"출력 텐서 개수: {len(self.output_infos)}")
+        return "\n".join(lines)
+
     def decode_keypoints(self, raw_outputs: dict) -> list[list[tuple[float, float, float]]]:
-        """*** 미검증 ***: hailo-rpi5-examples의 실제 후처리 로직으로 교체 필요."""
+        """*** 미구현 ***: hailo-rpi5-examples의 실제 후처리 로직을 이식해야 한다.
+
+        추측으로 구현하지 않는 이유: 출력 텐서 레이아웃이 모델 버전과 컴파일
+        옵션(NMS 포함 여부, 입력 해상도, 양자화 스케일)에 따라 달라진다.
+        잘못 디코딩하면 예외 대신 '그럴듯하지만 틀린 좌표'가 나오고, 그 값이
+        classify_posture()를 거쳐 백엔드 학습활동 기록까지 그대로 올라간다.
+        조용히 틀린 데이터가 쌓이는 것보다 여기서 멈추는 편이 낫다.
+
+        구현 절차:
+        1. Pi5에서 describe_outputs()로 실제 텐서 이름/shape 확인
+        2. hailo-ai/hailo-rpi5-examples 의 pose estimation 예제를 그대로 돌려
+           정상 동작을 먼저 확인
+        3. 그 예제의 후처리 함수를 여기로 옮기고, 좌표를 (x, y, conf) 17개
+           튜플 리스트로 변환해 반환 (COCO-17 순서 유지)
+        """
         raise NotImplementedError(
-            "YOLOv8-pose 출력 텐서 디코딩은 hailo-rpi5-examples의 공식 후처리 코드를 "
-            "이식해서 구현하세요. raw_outputs의 키/shape를 print로 확인 후 "
-            "해당 저장소의 postprocess 함수와 대조하는 것을 권장합니다."
+            "YOLOv8-pose 출력 디코딩 미구현. describe_outputs()로 텐서 형태를 확인한 뒤 "
+            "hailo-rpi5-examples의 공식 후처리 코드를 이식하세요. "
+            f"현재 출력 텐서: {[i.name for i in self.output_infos]}"
         )
