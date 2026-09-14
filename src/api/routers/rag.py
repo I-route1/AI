@@ -234,6 +234,10 @@ _SUBJECT_PATH_PATTERNS: dict[str, list[str]] = {
     "사회":   ["_05.사회_", ".사회_"],
     "한국사": ["한국사"],
 }
+# FAISS 벡터 검색을 건너뛰고 ConceptMap만 쓰는 과목.
+# AI-Hub 교육과정 코퍼스에 해당 과목 문서가 사실상 없어 검색 결과가 오히려 오염된다.
+_FAISS_EXCLUDED_SUBJECTS: frozenset[str] = frozenset({"한국사"})
+
 _SUBJECT_KEYWORDS: dict[str, list[str]] = {
     "수학":   ["수학", "방정식", "함수", "수열", "확률", "기하", "미적분", "삼각", "벡터", "행렬", "정수", "집합"],
     "영어":   ["영어", "English", "Grammar", "Reading", "Listening", "어법", "구문", "독해", "listening"],
@@ -277,6 +281,36 @@ def _extract_content(doc: str) -> str:
         return _clean_text(m.group(1).strip())
 
     return _clean_text(doc)
+
+
+_concept_vec_cache: dict[str, tuple[list[str], np.ndarray]] = {}
+
+
+def _concept_map_semantic(subject: str, query: str, k: int) -> list[str]:
+    """해당 과목 ConceptMap 항목을 쿼리와의 의미 유사도로 정렬해 상위 k개 반환.
+
+    키워드 매칭(_concept_map_search)이 실패한 질의에 쓴다. 예를 들어 '갑오개혁'은
+    ConceptMap 키 어디에도 없지만, 의미상 '조선'·'일제강점기' 항목이 가장 가깝다.
+    과목당 항목이 10~35개뿐이라 전량 비교해도 비용이 거의 없다. 벡터는 캐시한다.
+    """
+    entries = [v for keys, v in _CONCEPT_MAP.items() if keys[0] == subject]
+    if not entries:
+        return []
+    try:
+        cached = _concept_vec_cache.get(subject)
+        if cached is None or cached[0] != entries:
+            mat = np.vstack([_encode(e) for e in entries]).astype(np.float32)
+            faiss.normalize_L2(mat)
+            cached = (entries, mat)
+            _concept_vec_cache[subject] = cached
+
+        qv = _encode(query).astype(np.float32)
+        faiss.normalize_L2(qv)
+        scores = cached[1] @ qv[0]
+        order = np.argsort(-scores)[:k]
+        return [entries[i] for i in order]
+    except Exception:
+        return entries[:k]  # 임베딩 실패 시 기존 동작(앞에서 k개)으로 폴백
 
 
 def _filter_by_subject(docs: list[str], subject: str) -> list[str]:
@@ -329,6 +363,12 @@ def subject_aware_search(subject: str, query: str, k: int = 3) -> list[str]:
         return concept_hits[:k]
 
     # ── 2. FAISS fallback ──────────────────────────────────────────────────────
+    # 한국사는 코퍼스에 13건뿐(다른 과목은 7.6만~18.7만)이라 경로 필터가 사실상 실패하고,
+    # 키워드 필터("조선","고려","신라"…)로 넘어가 무관한 문서가 걸린다.
+    # (예: "신간회" 검색 → 발해 역사책 설명) 틀린 자료를 주느니 ConceptMap만 쓴다.
+    if subject in _FAISS_EXCLUDED_SUBJECTS:
+        return _concept_map_semantic(subject, query, k)
+
     if _index is not None and _doc_texts:
         try:
             enriched_query = f"{subject} 교육과정 {query} 개념 학습"
