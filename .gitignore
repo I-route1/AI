@@ -17,6 +17,15 @@ src/api/rag_db/
 venv_blackwell/
 *.faiss
 *.safetensors
+# AI-Hub OCR crop 학습 데이터 (training.bin 2.5GB, validation.bin 392MB)
+ocr/crops/
+# ocr/ocr_model.pt 등 학습된 체크포인트
+*.pt
+# rpi/attention_model.joblib 등 학습된 분류기
+*.joblib
+
+# 비밀정보가 하드코딩된 로컬 실행 스크립트 (JWT/DB/카카오 키, EC2 접속 정보)
+start-ai.ps1
 
 # 대용량 파일 확장자 제외
 *.json
