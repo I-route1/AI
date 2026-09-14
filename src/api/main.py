@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import json
@@ -27,6 +28,7 @@ import httpx
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 
+from src.api import model_registry
 from src.api.routers import counseling, predictor, writing, rag
 from src.api.routers.rag import subject_aware_search as _subject_aware_search
 from src.api.java_client import get_student_weakness_from_java
@@ -65,6 +67,20 @@ MATH_ADAPTER_PATH  = "train/math_adapter_qwen"
 WRITING_ADAPTER_PATH = "train/writing_adapter_qwen_weighted"
 MATH_SYSTEM_PROMPT = "당신은 수학 전문 교사입니다. 학생의 수학 문제에 대해 정확한 풀이와 해설을 제공하세요."
 
+# 과목별 교과 어댑터. system 프롬프트는 train/preprocess_curriculum.py의 SUBJECTS와
+# 글자 단위로 동일해야 한다 — 학습 때 쓴 문구와 다르면 파인튜닝 효과가 떨어진다.
+# 한국사는 AI-Hub 교육과정 데이터에 해당 과목이 없어 어댑터가 없다(Ollama fallback).
+SUBJECT_ADAPTERS: dict[str, tuple[str, str, str]] = {
+    "국어": ("korean",  "train/korean_adapter_qwen",
+             "당신은 국어 전문 교사입니다. 학생의 국어 지문과 질문에 대해 정확하고 이해하기 쉬운 답변을 제공하세요."),
+    "영어": ("english", "train/english_adapter_qwen",
+             "당신은 영어 전문 교사입니다. 학생의 영어 지문과 질문에 대해 정확하고 이해하기 쉬운 답변을 제공하세요."),
+    "과학": ("science", "train/science_adapter_qwen",
+             "당신은 과학 전문 교사입니다. 학생의 과학 지문과 질문에 대해 정확하고 이해하기 쉬운 답변을 제공하세요."),
+    "사회": ("social",  "train/social_adapter_qwen",
+             "당신은 사회 전문 교사입니다. 학생의 사회 지문과 질문에 대해 정확하고 이해하기 쉬운 답변을 제공하세요."),
+}
+
 print("📥 base 모델 로드 중 (4bit)...")
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
 if tokenizer.pad_token is None:
@@ -83,6 +99,19 @@ print("✅ 수학 어댑터 로드 완료")
 print("📥 글쓰기 어댑터 로드 중...")
 base_model.load_adapter(WRITING_ADAPTER_PATH, adapter_name="writing")
 print("✅ 글쓰기 어댑터 로드 완료")
+
+# 교과 어댑터는 LoRA(r=16, 7개 target_modules)라 개당 166MB — 4개 추가로 약 667MB 증가.
+# 4bit 베이스(~6GB)와 합쳐도 7GB 수준이라 16GB GPU에서는 여유가 있다.
+# 하나라도 실패하면 해당 과목만 Ollama fallback으로 떨어지고 서버 기동은 계속한다.
+_LOADED_SUBJECT_ADAPTERS: set[str] = set()
+for _subject, (_adapter_name, _adapter_path, _) in SUBJECT_ADAPTERS.items():
+    try:
+        print(f"📥 {_subject} 어댑터 로드 중...")
+        base_model.load_adapter(_adapter_path, adapter_name=_adapter_name)
+        _LOADED_SUBJECT_ADAPTERS.add(_subject)
+        print(f"✅ {_subject} 어댑터 로드 완료")
+    except Exception as _e:
+        print(f"⚠️ {_subject} 어댑터 로드 실패 — Ollama fallback 사용: {_e}")
 
 base_model.set_adapter("math")
 
@@ -134,17 +163,29 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
     return None
 
 
-def _math_concept_explain(concept_query: str) -> str | None:
-    """수학 어댑터로 개념 설명 생성. 실패 시 None(호출부에서 Ollama로 fallback)."""
+def _concept_explain(subject: str, concept_query: str) -> str | None:
+    """과목 어댑터로 개념 설명 생성. 어댑터가 없거나 실패하면 None(호출부에서 Ollama로 fallback).
+
+    프롬프트는 학습 포맷(train/preprocess_curriculum.py)과 맞춰 system + user 2턴으로 구성한다.
+    enable_thinking=False: 학습 데이터에 <think> 블록이 없어 켜두면 빈 사고 블록이 먼저 나온다.
+    """
     import logging
+
+    if subject == "수학":
+        adapter_name, system_prompt = "math", MATH_SYSTEM_PROMPT
+    elif subject in _LOADED_SUBJECT_ADAPTERS:
+        adapter_name, _, system_prompt = SUBJECT_ADAPTERS[subject]
+    else:
+        return None  # 한국사 등 어댑터 미보유 과목
+
     try:
         model     = app.state.model
         tokenizer = app.state.tokenizer
-        model.set_adapter("math")
+        model.set_adapter(adapter_name)
 
         messages = [
-            {"role": "system", "content": MATH_SYSTEM_PROMPT},
-            {"role": "user", "content": f"'{concept_query}' 개념의 핵심 포인트를 학생에게 설명해주세요."},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"질문: '{concept_query}' 개념의 핵심 포인트를 학생에게 설명해주세요."},
         ]
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
@@ -161,10 +202,15 @@ def _math_concept_explain(concept_query: str) -> str | None:
                 repetition_penalty=1.2,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        return text or None
     except Exception as e:
-        logging.warning(f"[수학 어댑터] 생성 실패: {e}")
+        logging.warning(f"[{subject} 어댑터] 생성 실패: {e}")
         return None
+
+
+# counseling 라우터가 main을 import하면 순환 참조가 되므로 registry를 통해 넘긴다.
+model_registry.register("concept_explain", _concept_explain)
 
 
 @app.post("/api/ai/report/subject-recommend")
@@ -196,9 +242,9 @@ async def generate_subject_recommendation(
         report += f"\n[관련 학습 자료]\n{rag_text}\n"
     report += f"\n[학습 전략]\n{strategy}"
 
-    llm_insight = None
-    if subject == "수학":
-        llm_insight = _math_concept_explain(concept_query)
+    # 파인튜닝된 과목 어댑터를 우선 쓰고, 어댑터가 없는 과목(한국사)만 Ollama로 넘긴다.
+    # GPU 생성은 수 초가 걸리는 블로킹 작업이라 threadpool로 빼서 이벤트 루프를 막지 않는다.
+    llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query)
 
     if not llm_insight:
         prompt = (
