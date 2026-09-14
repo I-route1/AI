@@ -1,11 +1,35 @@
+# Dependencies for the AI server (src/api).
+# NOTE: keep this file ASCII-only. pip decodes requirements files with the
+# locale encoding (cp949 on Korean Windows), so non-ASCII comments break it.
+#
+# Training scripts (train/) need only these plus whatever each script imports.
+# The Raspberry Pi modules (ocr/, rpi/) run in a separate env and also need
+# opencv-python.
+
+# --- Web server ---
 fastapi
 uvicorn[standard]
+pydantic
+python-dotenv
+httpx                 # java_client backend calls + Ollama calls
+
+# --- LLM serving ---
+# Install a torch build that matches the GPU first. RTX 50xx (Blackwell,
+# sm_120) needs a CUDA 12.8+ build; the default PyPI wheel will not work:
+#   pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+torch
+transformers
+peft                  # LoRA adapter loading (PeftModel) in src/api/main.py
+bitsandbytes          # 4bit NF4 quantization (BitsAndBytesConfig load_in_4bit)
+accelerate            # from_pretrained(device_map=...)
+
+# --- RAG ---
+faiss-cpu
+sentence-transformers
 numpy
+
+# --- Score predictor ---
+# predictor.py restores an sklearn model via joblib.load, so scikit-learn is
+# required at runtime, not just for training.
 joblib
 scikit-learn
-faiss-cpu
-transformers
-torch
-sentence-transformers
-python-dotenv
-pydantic
