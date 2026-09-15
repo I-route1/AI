@@ -50,10 +50,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(counseling.router, prefix="/api/ai", tags=["counseling"])
-app.include_router(predictor.router, prefix="/api/ai", tags=["predictor"])
-app.include_router(writing.router, prefix="/api/writing", tags=["writing"])
-app.include_router(rag.router, prefix="/api/rag", tags=["rag"])
+# ⚠️ 라우터 등록은 파일 맨 아래에 있다. counseling 라우터의 /report/{subject}가
+# catch-all이라, 먼저 등록하면 이 파일의 @app.post("/api/ai/report/subject-recommend")를
+# 가로챈다(FastAPI는 등록 순서대로 매칭). 자세한 설명은 파일 하단 참고.
 
 # 4bit 양자화 설정
 bnb_config = BitsAndBytesConfig(
@@ -244,3 +243,19 @@ async def generate_subject_recommendation(
         "targetConcept": concept_query,
         "aiRecommendationReport": report,
     }
+
+
+# ── 라우터 등록 (반드시 위의 @app 경로들을 모두 정의한 뒤) ──────────────────────
+# FastAPI/Starlette는 등록 순서대로 경로를 매칭한다. counseling 라우터의
+# /report/{subject}는 한 세그먼트를 전부 받는 catch-all이라, 이걸 먼저 등록하면
+# /api/ai/report/subject-recommend 요청까지 삼켜버린다. 그러면 report_subject()의
+# 필수 본문(req: dict) 검증에 걸려 422가 나고, 위에 정의한 전용 핸들러는
+# 영원히 호출되지 않는다.
+#
+# math/writing/premium은 같은 라우터 안에서 {subject}보다 위에 있어 문제가 없지만,
+# app 레벨 경로는 여기서 순서를 맞춰야 한다. 새 @app 경로를 추가할 때는 이 줄들보다
+# 위에 둘 것.
+app.include_router(counseling.router, prefix="/api/ai", tags=["counseling"])
+app.include_router(predictor.router, prefix="/api/ai", tags=["predictor"])
+app.include_router(writing.router, prefix="/api/writing", tags=["writing"])
+app.include_router(rag.router, prefix="/api/rag", tags=["rag"])
