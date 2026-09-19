@@ -59,7 +59,8 @@ class HailoPoseEstimator:
         return self.decode_keypoints(raw_outputs)
 
     def describe_outputs(self) -> str:
-        """.hef가 내보내는 출력 텐서의 이름/shape/포맷을 사람이 읽을 수 있게 정리.
+        """.hef가 내보내는 출력 텐서의 이름/shape/포맷을 정리하고, 어떤 후처리가
+        필요한 레이아웃인지까지 판정한다.
 
         decode_keypoints()를 구현하려면 먼저 이 정보가 필요하다. 출력이 어떤
         형태인지에 따라 후처리가 완전히 달라지기 때문이다:
@@ -68,14 +69,70 @@ class HailoPoseEstimator:
         Pi5에서 아래로 확인한다:
             python -c "from pathlib import Path; from rpi.pose_hailo import HailoPoseEstimator; \
                        print(HailoPoseEstimator(Path('rpi/yolov8_pose.hef')).describe_outputs())"
+
+        판정 결과를 그대로 옮겨 붙여 이슈에 남기면, 하드웨어 없는 쪽에서도
+        어느 디코더를 써야 하는지 판단할 수 있다.
         """
         lines = [f"input : {self.input_info.name}  shape={self.input_info.shape}"]
+        shapes = []
         for info in self.output_infos:
             fmt = getattr(getattr(info, "format", None), "type", None)
-            lines.append(f"output: {info.name}  shape={info.shape}"
+            shape = tuple(info.shape)
+            shapes.append(shape)
+            lines.append(f"output: {info.name}  shape={shape}"
                          + (f"  format={fmt}" if fmt is not None else ""))
         lines.append(f"출력 텐서 개수: {len(self.output_infos)}")
+        lines.append("")
+        lines.append(self._classify_layout(shapes))
         return "\n".join(lines)
+
+    def _classify_layout(self, shapes: list[tuple]) -> str:
+        """출력 shape로 후처리 방식을 판정한다.
+
+        YOLOv8-pose(COCO-17, 사람 1클래스)의 채널 수는 정해져 있다:
+          - 박스 분포(DFL): reg_max=16, 변 4개 -> 64채널
+          - 클래스 점수   : 1채널(person)
+          - 키포인트      : 17 x (x, y, conf) -> 51채널
+        raw로 컴파일되면 스트라이드 8/16/32에 대해 위 채널들이 따로 나온다.
+        NMS 포함으로 컴파일되면 검출 개수 축을 가진 텐서 하나로 나온다.
+        """
+        n = len(shapes)
+        flat = [s for s in shapes]
+        chans = {s[-1] for s in flat if len(s) >= 1}
+
+        hints = []
+        # raw 텐서 판정: 64/1/51 채널이 보이면 DFL 디코딩이 필요하다.
+        raw_markers = {64, 51}
+        if raw_markers & chans:
+            hints.append(
+                "판정: raw 텐서 (NMS 미포함)로 보인다. 64채널=DFL 박스 분포, "
+                "51채널=키포인트 17x3, 1채널=person 점수.\n"
+                "  -> DFL softmax·기댓값으로 박스를 복원하고, 스트라이드별 그리드 앵커를 "
+                "더한 뒤 NMS를 직접 돌려야 한다.\n"
+                "  -> hailo-rpi5-examples의 pose 후처리(.so 또는 파이썬 구현)를 "
+                "그대로 이식하는 편이 안전하다."
+            )
+        # NMS 포함 판정: 마지막 축이 검출 속성 개수(보통 6 또는 56=4+1+51)인 경우.
+        if chans & {6, 56, 57}:
+            hints.append(
+                "판정: NMS 포함으로 보인다(마지막 축이 검출 속성 개수). "
+                "박스·점수·키포인트가 이미 디코딩된 상태일 가능성이 높다.\n"
+                "  -> 좌표가 0~1 정규화인지 픽셀 단위인지만 확인하면 거의 그대로 쓸 수 있다."
+            )
+        if n >= 6 and not hints:
+            hints.append(
+                f"판정: 출력이 {n}개다. 스트라이드 3개 x (박스/점수/키포인트) = 9개 구조일 "
+                "가능성이 있다. 각 텐서의 마지막 축 채널 수로 역할을 가려야 한다."
+            )
+        if not hints:
+            hints.append(
+                "판정: 알려진 패턴에 맞지 않는다. 채널 수가 64(DFL)·51(키포인트)·1(점수)와 "
+                "다르면 모델 변형이거나 양자화 출력이 합쳐진 경우다. "
+                "hailo-rpi5-examples 예제를 먼저 돌려 정상 동작을 확인할 것."
+            )
+
+        hints.append(f"\n관측된 마지막 축 채널 수: {sorted(chans)}")
+        return "\n".join(hints)
 
     def decode_keypoints(self, raw_outputs: dict) -> list[list[tuple[float, float, float]]]:
         """*** 미구현 ***: hailo-rpi5-examples의 실제 후처리 로직을 이식해야 한다.
