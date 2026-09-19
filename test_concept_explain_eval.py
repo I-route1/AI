@@ -58,7 +58,10 @@ from peft import PeftModel
 from src.api.adapters import (  # noqa: E402
     BASE_MODEL_ID, MATH_ADAPTER_PATH, MATH_SYSTEM_PROMPT, SUBJECT_ADAPTERS,
 )
-from src.api.routers.rag import _CONCEPT_MAP  # noqa: E402
+# rag가 아니라 concept_map에서 직접 가져온다. rag는 import만 해도 FAISS 인덱스
+# (69만 벡터)와 sentence-transformers를 올리는데, 그 상태로 8B 4bit 모델까지
+# 로드하면 프로세스가 죽는다(exit 139). 여기서 필요한 건 딕셔너리 하나뿐이다.
+from src.api.concept_map import CONCEPT_MAP as _CONCEPT_MAP  # noqa: E402
 
 SEED = 42
 
@@ -204,6 +207,9 @@ def main():
 
         # 변별력 대조군: 같은 과목의 다른 개념 참조 (과목이 달라 쉬운 대조가 되지 않도록)
         pool = [t for _, t in items]
+        if len(pool) < 2:
+            print(f"  [{subject}] 항목이 {len(pool)}개뿐이라 대조군을 만들 수 없습니다. 건너뜁니다.")
+            continue
 
         for idx, (concept, ref) in enumerate(items):
             key_terms = distinctive(ref, df, n_docs)
