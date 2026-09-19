@@ -58,6 +58,18 @@ def extract_answer(text: str) -> str:
     return first.strip()
 
 
+def truncated_before_answer(text: str) -> bool:
+    """'정답:'에 도달하지 못한 채 생성이 끝났는지.
+
+    CoT 어댑터(math_adapter_qwen_cot)는 풀이를 먼저 쓰고 마지막에 정답을 낸다.
+    max_new_tokens가 부족하면 풀이 도중에 잘려 정답이 아예 나오지 않는데,
+    이때 extract_answer()는 첫 줄(풀이 앞부분)을 답으로 오인한다. 그러면 모델
+    성능이 아니라 생성 길이 때문에 점수가 깎인다. 이 비율을 따로 보고해서
+    그런 상황을 눈에 띄게 한다.
+    """
+    return not re.search(r"정답\s*[:：]", text)
+
+
 def normalize(ans: str) -> str:
     s = ans
     for c, d in _CIRCLED.items():
@@ -107,7 +119,11 @@ def generate(model, tokenizer, messages, max_new_tokens: int) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=100)
-    ap.add_argument("--max-new-tokens", type=int, default=160)
+    ap.add_argument("--max-new-tokens", type=int, default=160,
+                    help="CoT 어댑터는 풀이를 먼저 쓰고 정답을 마지막에 내므로 "
+                         "512 이상을 줘야 한다. 부족하면 정답 이전에 잘린다.")
+    ap.add_argument("--adapter", default=MATH_ADAPTER_PATH,
+                    help="평가할 수학 어댑터 경로. CoT 재학습본과 비교할 때 바꿔 넣는다.")
     ap.add_argument("--show", type=int, default=5, help="샘플 출력 개수")
     ap.add_argument("--text-only", action="store_true",
                     help="그림·표를 참조하는 문항을 제외. 텍스트 전용 모델이라 "
@@ -131,12 +147,12 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID, quantization_config=bnb, device_map={"": 0})
-    model = PeftModel.from_pretrained(model, MATH_ADAPTER_PATH, adapter_name="math")
+    model = PeftModel.from_pretrained(model, args.adapter, adapter_name="math")
     model.set_adapter("math")
     model.eval()
-    print("로드 완료\n", flush=True)
+    print(f"로드 완료 (어댑터: {args.adapter}, max_new_tokens={args.max_new_tokens})\n", flush=True)
 
-    stats = {k: {"exact": 0, "f1": 0.0, "mcq_hit": 0, "mcq_n": 0, "fmt": 0}
+    stats = {k: {"exact": 0, "f1": 0.0, "mcq_hit": 0, "mcq_n": 0, "fmt": 0, "cut": 0}
              for k in ("adapter", "base")}
     shown = 0
     t0 = time.time()
@@ -155,6 +171,7 @@ def main():
             ans = extract_answer(raw)
             s = stats[key]
             s["fmt"] += bool(re.search(r"정답\s*[:：]", raw))
+            s["cut"] += truncated_before_answer(raw)
             s["exact"] += normalize(ans) == ref_norm
             s["f1"] += char_f1(normalize(ans), ref_norm)
             if ref_choice:
@@ -186,8 +203,13 @@ def main():
         line(f"객관식 일치(n={sa['mcq_n']})", sa["mcq_hit"] / sa["mcq_n"], sb["mcq_hit"] / sb["mcq_n"])
     line("char-F1(정답줄)", sa["f1"] / n, sb["f1"] / n, pct=False)
     line("'정답:' 형식 준수", sa["fmt"] / n, sb["fmt"] / n)
+    line("정답 전 잘림", sa["cut"] / n, sb["cut"] / n)
     print("=" * 74)
-    print(f"평가 문항 {n}건 / 소요 {time.time() - t0:.0f}s")
+    print(f"평가 문항 {n}건 / max_new_tokens {args.max_new_tokens} / 소요 {time.time() - t0:.0f}s")
+    if sa["cut"] / n > 0.05:
+        print(f"\n!! 어댑터 출력의 {sa['cut'] / n:.1%}가 '정답:'에 도달하지 못하고 잘렸습니다.")
+        print("   --max-new-tokens를 늘려 다시 재야 합니다. 지금 수치는 모델 성능이 아니라")
+        print("   생성 길이 제한을 반영한 값입니다.")
 
 
 if __name__ == "__main__":
