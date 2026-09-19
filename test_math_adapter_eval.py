@@ -90,6 +90,22 @@ def choice_number(ans: str) -> str | None:
     return m.group(1) if m else None
 
 
+def strip_choice(ans: str) -> str:
+    """보기 번호를 떼고 값만 남긴다.
+
+    CoT 어댑터에서 '값은 맞는데 보기 번호가 틀린' 사례가 관측됐다.
+        정답   : ③ 40°
+        어댑터 : ① 40°
+    이 경우 객관식 일치는 오답이지만 수리 추론 자체는 성공한 것이다. 둘을
+    구분하지 못하면 "추론이 나빠졌다"와 "번호 매핑에서 실패한다"를 혼동한다.
+    """
+    s = ans.strip()
+    for c in _CIRCLED:
+        if s.startswith(c):
+            return s[1:].strip()
+    return re.sub(r"^\(?[1-9]\)?[.)]\s*", "", s).strip()
+
+
 def char_f1(pred: str, ref: str) -> float:
     p, r = Counter(c for c in pred if not c.isspace()), Counter(c for c in ref if not c.isspace())
     overlap = sum((p & r).values())
@@ -152,7 +168,8 @@ def main():
     model.eval()
     print(f"로드 완료 (어댑터: {args.adapter}, max_new_tokens={args.max_new_tokens})\n", flush=True)
 
-    stats = {k: {"exact": 0, "f1": 0.0, "mcq_hit": 0, "mcq_n": 0, "fmt": 0, "cut": 0}
+    stats = {k: {"exact": 0, "f1": 0.0, "mcq_hit": 0, "mcq_n": 0, "fmt": 0, "cut": 0,
+                 "val_hit": 0, "num_only_miss": 0}
              for k in ("adapter", "base")}
     shown = 0
     t0 = time.time()
@@ -176,7 +193,12 @@ def main():
             s["f1"] += char_f1(normalize(ans), ref_norm)
             if ref_choice:
                 s["mcq_n"] += 1
-                s["mcq_hit"] += choice_number(ans) == ref_choice
+                hit = choice_number(ans) == ref_choice
+                s["mcq_hit"] += hit
+                # 번호는 틀렸지만 값은 맞은 경우를 따로 센다
+                val_ok = normalize(strip_choice(ans)) == normalize(strip_choice(ref))
+                s["val_hit"] += val_ok
+                s["num_only_miss"] += (val_ok and not hit)
 
         if shown < args.show:
             shown += 1
@@ -201,10 +223,14 @@ def main():
     line("정답 일치", sa["exact"] / n, sb["exact"] / n)
     if sa["mcq_n"]:
         line(f"객관식 일치(n={sa['mcq_n']})", sa["mcq_hit"] / sa["mcq_n"], sb["mcq_hit"] / sb["mcq_n"])
+        line("  └ 값만 일치(번호 무시)", sa["val_hit"] / sa["mcq_n"], sb["val_hit"] / sb["mcq_n"])
     line("char-F1(정답줄)", sa["f1"] / n, sb["f1"] / n, pct=False)
     line("'정답:' 형식 준수", sa["fmt"] / n, sb["fmt"] / n)
     line("정답 전 잘림", sa["cut"] / n, sb["cut"] / n)
     print("=" * 74)
+    if sa["mcq_n"]:
+        print(f"\n값은 맞고 보기 번호만 틀린 경우: 어댑터 {sa['num_only_miss']}건 / "
+              f"베이스 {sb['num_only_miss']}건 (객관식 {sa['mcq_n']}건 중)")
     print(f"평가 문항 {n}건 / max_new_tokens {args.max_new_tokens} / 소요 {time.time() - t0:.0f}s")
     if sa["cut"] / n > 0.05:
         print(f"\n!! 어댑터 출력의 {sa['cut'] / n:.1%}가 '정답:'에 도달하지 못하고 잘렸습니다.")
