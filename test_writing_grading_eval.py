@@ -208,11 +208,60 @@ def train_prior() -> list[float]:
     return [counts[c] / total for c in SCALE]
 
 
+def baseline_analysis(rows: list[dict], y_true: list[int]) -> None:
+    """서빙의 규칙 기반 점수가 얼마나 신호를 담고 있는지 가늠한다 (GPU 불필요).
+
+    `/api/writing/evaluate`의 final_score는 키워드 일치율 70% + 길이 비율 30%다.
+    이 평가셋에는 키워드도 모범답안도 없어서 키워드 항목은 잴 수 없지만,
+    **길이 항목은 잴 수 있다.** 길이가 답안 품질을 얼마나 설명하는지 보면
+    규칙 기반 접근의 상한을 짐작할 수 있다.
+    """
+    import statistics as stat
+
+    def student_answer(msgs) -> str:
+        c = msgs[1]["content"]
+        i = c.find("[학생 답안]:")
+        return c[i + 8:].strip() if i >= 0 else ""
+
+    lens = [len(student_answer(r["messages"])) for r in rows]
+    n = len(lens)
+
+    mx, my = stat.mean(lens), stat.mean(y_true)
+    sx, sy = stat.pstdev(lens), stat.pstdev(y_true)
+    cor = (sum((a - mx) * (b - my) for a, b in zip(lens, y_true)) / n / (sx * sy)) if sx and sy else 0.0
+
+    print("\n" + "=" * 88)
+    print("규칙 기반 점수의 상한 가늠 — 길이 항목이 품질을 설명하는가")
+    print("=" * 88)
+    print(f"답안 길이 vs 실제 점수 피어슨 상관: {cor:.3f}")
+    for s in SCALE:
+        sub = [l for l, g in zip(lens, y_true) if g == s]
+        if sub:
+            print(f"  {s}점(n={len(sub):3}) 답안 길이 중앙값 {int(stat.median(sub)):5}자")
+
+    q = stat.quantiles(lens, n=4)
+    pred = [1 if L < q[0] else 2 if L < q[1] else 3 if L < q[2] else 4 for L in lens]
+    r = summarize("길이 4분위", y_true, pred)
+    maj = Counter(y_true).most_common(1)[0][0]
+    b = summarize(f"항상 {maj}점", y_true, [maj] * n)
+    print(f"\n{'예측 방법':<28}{'QWK':>8}{'정확도':>10}{'평균오차':>10}")
+    print("-" * 60)
+    print(f"{'길이 4분위로만 예측':<28}{r['qwk']:>8.3f}{r['acc']:>9.1%}{r['mae']:>10.3f}")
+    print(f"{f'항상 {maj}점 (상수)':<28}{b['qwk']:>8.3f}{b['acc']:>9.1%}{b['mae']:>10.3f}")
+    print("-" * 60)
+    print("비교: 파인튜닝 채점기(weighted + 기댓값) QWK 0.553 / 58.7% / 0.423")
+    print("\n키워드 항목(가중치 70%)은 이 평가셋에 키워드가 없어 재지 못했다.")
+    print("=" * 88)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=None, help="평가 건수(기본: 전체 777건)")
     ap.add_argument("--adapters", nargs="*", default=DEFAULT_ADAPTERS)
     ap.add_argument("--include-base", action="store_true", help="베이스 모델(어댑터 비활성)도 평가")
+    ap.add_argument("--baseline-analysis", action="store_true",
+                    help="서빙의 규칙 기반 점수(키워드 70%% + 길이 30%%)가 얼마나 신호를 "
+                         "담고 있는지 길이 항목으로 가늠한다. 모델을 안 띄우므로 GPU가 필요 없다.")
     ap.add_argument("--logit-sweep", action="store_true",
                     help="점수 토큰 로짓을 직접 읽어 디코딩 전략(argmax / logit adjustment / "
                          "기댓값)을 비교한다. 재학습 없이 1점 재현율을 올릴 수 있는지 보는 용도.")
@@ -225,6 +274,10 @@ def main():
 
     print(f"평가 표본: {n}건")
     print("정답 분포: " + "  ".join(f"{c}점 {dist[c]}건({dist[c]/n:.1%})" for c in SCALE))
+
+    if args.baseline_analysis:
+        baseline_analysis(rows, y_true)
+        return
 
     # ── 기준선 (모델 없이 계산 가능) ──────────────────────────────────────────
     majority = dist.most_common(1)[0][0]
