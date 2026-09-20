@@ -273,15 +273,6 @@ async def evaluate(request: Request, req: EvaluateRequest):
     else:
         feedback_type = "POOR"
 
-    if final_score >= 80:
-        feedback_type = "EXCELLENT"
-    elif final_score >= 60:
-        feedback_type = "GOOD"
-    elif final_score >= 40:
-        feedback_type = "NEEDS_IMPROVEMENT"
-    else:
-        feedback_type = "POOR"
-
     # LLM 피드백 시도 → 실패 시 규칙 기반 fallback
     llm_fb, score_feedback = _llm_feedback(
         request, req.question_text, req.model_answer, req.user_answer, missing, final_score
