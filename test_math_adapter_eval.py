@@ -141,6 +141,13 @@ def main():
     ap.add_argument("--adapter", default=MATH_ADAPTER_PATH,
                     help="평가할 수학 어댑터 경로. CoT 재학습본과 비교할 때 바꿔 넣는다.")
     ap.add_argument("--show", type=int, default=5, help="샘플 출력 개수")
+    ap.add_argument("--dump", default=None,
+                    help="문항별 원문·판정을 JSONL로 저장. 두 어댑터를 같은 표본으로 돌린 뒤 "
+                         "McNemar 검정처럼 짝지어 비교하려면 이게 있어야 한다.")
+    ap.add_argument("--skip-base", action="store_true",
+                    help="베이스 생성을 건너뛴다. 디코딩이 greedy라 베이스 출력은 실행마다 "
+                         "동일하므로, 어댑터 둘을 비교할 때 두 번째 실행에서는 낭비다. "
+                         "(생성 시간이 절반으로 준다)")
     ap.add_argument("--text-only", action="store_true",
                     help="그림·표를 참조하는 문항을 제외. 텍스트 전용 모델이라 "
                          "'다음 그림에서…' 같은 문항은 애초에 풀 수 없어 점수를 깎는다.")
@@ -173,6 +180,7 @@ def main():
              for k in ("adapter", "base")}
     shown = 0
     t0 = time.time()
+    dump_f = open(args.dump, "w", encoding="utf-8") if args.dump else None
 
     for i, row in enumerate(rows, 1):
         msgs = row["messages"]
@@ -181,10 +189,15 @@ def main():
         ref_norm, ref_choice = normalize(ref), choice_number(ref)
 
         pred_a = generate(model, tokenizer, prompt_msgs, args.max_new_tokens)
-        with model.disable_adapter():
-            pred_b = generate(model, tokenizer, prompt_msgs, args.max_new_tokens)
+        if args.skip_base:
+            pred_b = None
+            conds = (("adapter", pred_a),)
+        else:
+            with model.disable_adapter():
+                pred_b = generate(model, tokenizer, prompt_msgs, args.max_new_tokens)
+            conds = (("adapter", pred_a), ("base", pred_b))
 
-        for key, raw in (("adapter", pred_a), ("base", pred_b)):
+        for key, raw in conds:
             ans = extract_answer(raw)
             s = stats[key]
             s["fmt"] += bool(re.search(r"정답\s*[:：]", raw))
@@ -200,37 +213,73 @@ def main():
                 s["val_hit"] += val_ok
                 s["num_only_miss"] += (val_ok and not hit)
 
+        if dump_f is not None:
+            ans_a = extract_answer(pred_a)
+            dump_f.write(json.dumps({
+                "i": i,
+                "ref": ref, "ref_choice": ref_choice,
+                "adapter_answer": ans_a,
+                "adapter_choice": choice_number(ans_a),
+                "exact": normalize(ans_a) == ref_norm,
+                "mcq_hit": (choice_number(ans_a) == ref_choice) if ref_choice else None,
+                "val_hit": (normalize(strip_choice(ans_a)) == normalize(strip_choice(ref)))
+                           if ref_choice else None,
+                "raw": pred_a,
+            }, ensure_ascii=False) + "\n")
+            dump_f.flush()
+
         if shown < args.show:
             shown += 1
             print(f"─── 샘플 {shown}")
             print(f"  정답     : {ref[:90]}")
             print(f"  어댑터   : {extract_answer(pred_a)[:90]}")
-            print(f"  베이스   : {extract_answer(pred_b)[:90]}", flush=True)
+            if pred_b is not None:
+                print(f"  베이스   : {extract_answer(pred_b)[:90]}", flush=True)
 
         if i % 10 == 0:
             print(f"  {i}/{len(rows)} ({time.time() - t0:.0f}s)", flush=True)
 
     n = len(rows)
+    sa, sb = stats["adapter"], stats["base"]
+    has_base = sb["mcq_n"] > 0 or not args.skip_base
+
     print("\n" + "=" * 74)
-    print(f"{'지표':<22}{'어댑터':>12}{'베이스':>12}{'Δ':>12}")
+    if has_base:
+        print(f"{'지표':<22}{'어댑터':>12}{'베이스':>12}{'Δ':>12}")
+    else:
+        print(f"{'지표':<22}{'어댑터':>12}   (베이스 생략 — --skip-base)")
     print("=" * 74)
 
     def line(name, a, b, pct=True):
         fmt = (lambda v: f"{v * 100:>10.1f}%") if pct else (lambda v: f"{v:>11.3f}")
+        if not has_base:
+            print(f"{name:<22}{fmt(a)}")
+            return
         print(f"{name:<22}{fmt(a)}{fmt(b)}{('%+.1f%%' % ((a - b) * 100)) if pct else ('%+.3f' % (a - b)):>12}")
 
-    sa, sb = stats["adapter"], stats["base"]
-    line("정답 일치", sa["exact"] / n, sb["exact"] / n)
+    def bdiv(d: dict, key: str, denom_key: str) -> float:
+        """베이스를 건너뛰면 분모가 0이다."""
+        denom = d[denom_key] if isinstance(denom_key, int) else d.get(denom_key, 0)
+        return d[key] / denom if denom else 0.0
+
+    nb = n if has_base else 1
+    line("정답 일치", sa["exact"] / n, sb["exact"] / nb)
     if sa["mcq_n"]:
-        line(f"객관식 일치(n={sa['mcq_n']})", sa["mcq_hit"] / sa["mcq_n"], sb["mcq_hit"] / sb["mcq_n"])
-        line("  └ 값만 일치(번호 무시)", sa["val_hit"] / sa["mcq_n"], sb["val_hit"] / sb["mcq_n"])
-    line("char-F1(정답줄)", sa["f1"] / n, sb["f1"] / n, pct=False)
-    line("'정답:' 형식 준수", sa["fmt"] / n, sb["fmt"] / n)
-    line("정답 전 잘림", sa["cut"] / n, sb["cut"] / n)
+        line(f"객관식 일치(n={sa['mcq_n']})", sa["mcq_hit"] / sa["mcq_n"],
+             bdiv(sb, "mcq_hit", "mcq_n"))
+        line("  └ 값만 일치(번호 무시)", sa["val_hit"] / sa["mcq_n"],
+             bdiv(sb, "val_hit", "mcq_n"))
+    line("char-F1(정답줄)", sa["f1"] / n, sb["f1"] / nb, pct=False)
+    line("'정답:' 형식 준수", sa["fmt"] / n, sb["fmt"] / nb)
+    line("정답 전 잘림", sa["cut"] / n, sb["cut"] / nb)
     print("=" * 74)
     if sa["mcq_n"]:
-        print(f"\n값은 맞고 보기 번호만 틀린 경우: 어댑터 {sa['num_only_miss']}건 / "
-              f"베이스 {sb['num_only_miss']}건 (객관식 {sa['mcq_n']}건 중)")
+        tail = f" / 베이스 {sb['num_only_miss']}건" if has_base else ""
+        print(f"\n값은 맞고 보기 번호만 틀린 경우: 어댑터 {sa['num_only_miss']}건{tail} "
+              f"(객관식 {sa['mcq_n']}건 중)")
+    if dump_f is not None:
+        dump_f.close()
+        print(f"문항별 결과 저장: {args.dump}")
     print(f"평가 문항 {n}건 / max_new_tokens {args.max_new_tokens} / 소요 {time.time() - t0:.0f}s")
     if sa["cut"] / n > 0.05:
         print(f"\n!! 어댑터 출력의 {sa['cut'] / n:.1%}가 '정답:'에 도달하지 못하고 잘렸습니다.")
