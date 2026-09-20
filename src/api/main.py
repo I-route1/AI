@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -144,6 +145,33 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
     return None
 
 
+# 베이스 모델은 마크다운 헤더·이모지·수평선을 섞어 쓴다("## 📌 1. **정의**").
+# 어댑터는 그런 걸 쓰지 않아서 지금까지 문제가 없었는데, 수학을 베이스로 돌리면서
+# 학생에게 보이는 리포트에 그대로 흘러 들어가게 됐다. writing.py의 _llm_feedback()도
+# 같은 이유로 LLM 출력에서 마크다운을 걷어낸다.
+_MD_HEADER = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)   # 헤더 기호만 제거, 제목 텍스트는 남긴다
+_MD_RULE   = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", re.MULTILINE)
+# 굵게 표시는 **쌍**으로만 잡는다. 홑별표까지 지우면 수학 설명의 곱셈 기호가
+# 사라진다(2*3=6 -> 23=6). 수학을 베이스로 돌리는 이상 이건 실제로 발생한다.
+_MD_BOLD   = re.compile(r"\*{2,3}(.+?)\*{2,3}", re.DOTALL)
+_EMOJI     = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF️←-⇿⬀-⯿]"
+)
+
+
+def _strip_markdown(text: str) -> str:
+    """개념 설명 출력에서 마크다운·이모지를 걷어내고 평문 문단으로 정리한다."""
+    text = _MD_RULE.sub("", text)
+    text = _MD_HEADER.sub("", text)
+    text = _MD_BOLD.sub(r"\1", text)
+    text = _EMOJI.sub("", text)
+    # 빈 줄이 여러 개 생기므로 문단 구분은 한 줄로 통일하고 줄 끝 공백을 없앤다
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
 def _concept_explain(subject: str, concept_query: str) -> str | None:
     """과목 어댑터로 개념 설명 생성. 어댑터가 없거나 실패하면 None(호출부에서 Ollama로 fallback).
 
@@ -153,7 +181,18 @@ def _concept_explain(subject: str, concept_query: str) -> str | None:
     import logging
 
     if subject == "수학":
-        adapter_name, system_prompt = "math", MATH_SYSTEM_PROMPT
+        # 수학은 어댑터를 쓰지 않고 베이스로 생성한다.
+        #
+        # math 어댑터는 "정답: ... / 풀이: ..." 문제 풀이 전용으로 학습돼서,
+        # 개념 설명을 시켜도 그 형식으로 답한다. test_concept_explain_eval.py로
+        # 재보니 수학 15건 전부(100%)가 그랬다:
+        #     질문:   '지수함수' 개념의 핵심 포인트를 설명해주세요.
+        #     어댑터: 정답: 지수함수는 다음과 같은 형태로 나타냅니다.
+        #             풀이: ① $y=a^{x}$ ...
+        # 개념 커버리지도 베이스보다 낮다(0.185 vs 0.311 - 5개 과목 중 낙폭 최대).
+        # counseling.py의 _math_report()는 같은 이유로 이미 math 어댑터를 쓰지
+        # 않는데, 이 경로에는 그 판단이 반영돼 있지 않았다.
+        adapter_name, system_prompt = None, MATH_SYSTEM_PROMPT
     elif subject in _LOADED_SUBJECT_ADAPTERS:
         adapter_name, _, system_prompt = SUBJECT_ADAPTERS[subject]
     else:
@@ -162,7 +201,6 @@ def _concept_explain(subject: str, concept_query: str) -> str | None:
     try:
         model     = app.state.model
         tokenizer = app.state.tokenizer
-        model.set_adapter(adapter_name)
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -174,19 +212,28 @@ def _concept_explain(subject: str, concept_query: str) -> str | None:
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to("cuda")
         input_len = inputs["input_ids"].shape[-1]
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=200,
-                temperature=0.3,
-                do_sample=True,
-                repetition_penalty=1.2,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+        def _gen():
+            with torch.no_grad():
+                return model.generate(
+                    **inputs,
+                    max_new_tokens=200,
+                    temperature=0.3,
+                    do_sample=True,
+                    repetition_penalty=1.2,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+
+        if adapter_name is None:
+            with model.disable_adapter():
+                outputs = _gen()
+        else:
+            model.set_adapter(adapter_name)
+            outputs = _gen()
+
         text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
-        return text or None
+        return _strip_markdown(text) or None
     except Exception as e:
-        logging.warning(f"[{subject} 어댑터] 생성 실패: {e}")
+        logging.warning(f"[{subject} 개념 설명] 생성 실패: {e}")
         return None
 
 
