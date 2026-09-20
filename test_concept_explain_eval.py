@@ -235,6 +235,12 @@ def main():
                     "fmt": float(bool(_ANSWER_FMT.search(pred))),
                     "echo": float("핵심 포인트를 학생에게" in pred),
                     "empty": float(not pred.strip()),
+                    # 커버리지는 길이에 영향을 받는다. 교과 어댑터는 학습 답안이
+                    # 20~44자로 짧아(영어가 20자로 최단) 한 문장만 내놓는 경향이
+                    # 있고, 그러면 100자 안팎인 참조를 물리적으로 담지 못한다.
+                    # 커버리지가 낮은 게 '내용이 틀려서'인지 '짧아서'인지
+                    # 구분하려면 길이를 같이 봐야 한다.
+                    "len": float(len(pred)),
                 })
 
             if shown < args.show:
@@ -272,6 +278,8 @@ def main():
     print("\n" + "=" * 86)
     print("생성 건전성 (어댑터 / 베이스)")
     print("=" * 86)
+    la, lb = agg(None, "adapter", "len"), agg(None, "base", "len")
+    print(f"{'평균 출력 길이(자)':<20}{la:>8.0f} /{lb:>8.0f}   (커버리지 해석에 필요 — 위 설명 참고)")
     for label, field, good in (("한국어 비율", "ko", "높을수록 좋음"),
                                ("반복률", "rep", "낮을수록 좋음"),
                                ("'정답:' 형식 오염", "fmt", "낮을수록 좋음"),

@@ -151,9 +151,18 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
 # 같은 이유로 LLM 출력에서 마크다운을 걷어낸다.
 _MD_HEADER = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)   # 헤더 기호만 제거, 제목 텍스트는 남긴다
 _MD_RULE   = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", re.MULTILINE)
-# 굵게 표시는 **쌍**으로만 잡는다. 홑별표까지 지우면 수학 설명의 곱셈 기호가
-# 사라진다(2*3=6 -> 23=6). 수학을 베이스로 돌리는 이상 이건 실제로 발생한다.
-_MD_BOLD   = re.compile(r"\*{2,3}(.+?)\*{2,3}", re.DOTALL)
+# 별표는 겹별표(**굵게**, 짝이 안 맞고 남은 ** 포함)만 지운다. 겹별표가 곱셈을
+# 뜻하는 경우는 없어서 안전하다.
+#
+# 홑별표 이탤릭(*was read*)은 일부러 그냥 둔다. 영어 예문에 제법 나오지만,
+# 지우려 들면 곱셈 기호를 먹는다:
+#     "넓이는 a*b 이고 둘레는 2*(a+b)"  ->  "넓이는 ab 이고 둘레는 2(a+b)"
+# 한 줄에 별표가 둘이면 무엇을 해도 이탤릭 쌍과 구분되지 않는다. 남은 별표는
+# 보기 사나운 정도지만 수식이 틀리는 것은 내용 오류다. 덜 나쁜 쪽을 택한다.
+_MD_BOLD_PAIR     = re.compile(r"\*{2,3}(.+?)\*{2,3}", re.DOTALL)
+_MD_BOLD_LEFTOVER = re.compile(r"\*{2,}")
+# $...$ 안의 수식은 손대지 않는다. 치환 전에 빼뒀다가 마지막에 되돌린다.
+_LATEX_SPAN = re.compile(r"\$[^$\n]*\$")
 _EMOJI     = re.compile(
     "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF️←-⇿⬀-⯿]"
 )
@@ -161,19 +170,52 @@ _EMOJI     = re.compile(
 
 def _strip_markdown(text: str) -> str:
     """개념 설명 출력에서 마크다운·이모지를 걷어내고 평문 문단으로 정리한다."""
+    latex: list[str] = []
+
+    def _hide(m: "re.Match[str]") -> str:
+        latex.append(m.group(0))
+        return f"\x00{len(latex) - 1}\x00"
+
+    text = _LATEX_SPAN.sub(_hide, text)
     text = _MD_RULE.sub("", text)
     text = _MD_HEADER.sub("", text)
-    text = _MD_BOLD.sub(r"\1", text)
+    text = _MD_BOLD_PAIR.sub(r"\1", text)
+    text = _MD_BOLD_LEFTOVER.sub("", text)
     text = _EMOJI.sub("", text)
     # 빈 줄이 여러 개 생기므로 문단 구분은 한 줄로 통일하고 줄 끝 공백을 없앤다
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{2,}", "\n", text)
+    text = re.sub(r"\x00(\d+)\x00", lambda m: latex[int(m.group(1))], text)
     return text.strip()
 
 
+# 개념 설명에서 어댑터를 끄고 베이스로 생성할 과목.
+# 근거는 test_concept_explain_eval.py 측정값이다(어댑터/베이스 커버리지):
+#
+#   수학 0.185/0.311   영어 0.079/0.183   <- 베이스 사용
+#   국어 0.097/0.111   과학 0.130/0.160   사회 0.112/0.142   <- 어댑터 유지
+#
+# 수학: math 어댑터는 "정답:/풀이:" 문제 풀이 전용으로 학습돼서 개념 설명을
+#   시켜도 그 형식으로 답한다. 측정한 15건 전부(100%)가 그랬다.
+#   counseling.py의 _math_report()는 같은 이유로 이미 math 어댑터를 쓰지 않는다.
+# 영어: 격차가 2.3배로 가장 크다. 영어 어댑터의 학습 답안이 중앙값 20자로
+#   전 과목 최단이라(국어 35 / 사회 39 / 과학 44) 한 문장만 내놓는다.
+#   실제로 '수동태'를 물으면 "be + 과거분사"조차 언급하지 않는다.
+#   베이스는 한국어 비율이 0.711로 낮지만, 영어 과목 설명에 영어 용어가
+#   섞이는 것은 결함이 아니다.
+#
+# 나머지 3과목을 유지하는 이유: 격차가 1.2~1.3배로 작고, 어댑터 쪽이 한국어
+# 비율(0.965 vs 0.885)과 반복률(0.027 vs 0.101)에서 낫다. 출력도 쓸 만하다.
+_CONCEPT_USE_BASE: frozenset[str] = frozenset({"수학", "영어"})
+
+
 def _concept_explain(subject: str, concept_query: str) -> str | None:
-    """과목 어댑터로 개념 설명 생성. 어댑터가 없거나 실패하면 None(호출부에서 Ollama로 fallback).
+    """개념 설명 생성. 생성할 수 없으면 None(호출부에서 Ollama로 fallback).
+
+    과목마다 어댑터를 쓸지 베이스를 쓸지 다르다 — _CONCEPT_USE_BASE 참고.
+    어댑터가 항상 나은 것이 아니라서, 과목별로 측정해 정한 값이다.
+    system 프롬프트는 어느 쪽이든 해당 과목 것을 그대로 쓴다(측정도 그 조합으로 했다).
 
     프롬프트는 학습 포맷(train/preprocess_curriculum.py)과 맞춰 system + user 2턴으로 구성한다.
     enable_thinking=False: 학습 데이터에 <think> 블록이 없어 켜두면 빈 사고 블록이 먼저 나온다.
@@ -181,18 +223,10 @@ def _concept_explain(subject: str, concept_query: str) -> str | None:
     import logging
 
     if subject == "수학":
-        # 수학은 어댑터를 쓰지 않고 베이스로 생성한다.
-        #
-        # math 어댑터는 "정답: ... / 풀이: ..." 문제 풀이 전용으로 학습돼서,
-        # 개념 설명을 시켜도 그 형식으로 답한다. test_concept_explain_eval.py로
-        # 재보니 수학 15건 전부(100%)가 그랬다:
-        #     질문:   '지수함수' 개념의 핵심 포인트를 설명해주세요.
-        #     어댑터: 정답: 지수함수는 다음과 같은 형태로 나타냅니다.
-        #             풀이: ① $y=a^{x}$ ...
-        # 개념 커버리지도 베이스보다 낮다(0.185 vs 0.311 - 5개 과목 중 낙폭 최대).
-        # counseling.py의 _math_report()는 같은 이유로 이미 math 어댑터를 쓰지
-        # 않는데, 이 경로에는 그 판단이 반영돼 있지 않았다.
         adapter_name, system_prompt = None, MATH_SYSTEM_PROMPT
+    elif subject in _CONCEPT_USE_BASE and subject in SUBJECT_ADAPTERS:
+        _, _, system_prompt = SUBJECT_ADAPTERS[subject]
+        adapter_name = None
     elif subject in _LOADED_SUBJECT_ADAPTERS:
         adapter_name, _, system_prompt = SUBJECT_ADAPTERS[subject]
     else:
