@@ -82,18 +82,35 @@ print("📥 글쓰기 어댑터 로드 중...")
 base_model.load_adapter(WRITING_ADAPTER_PATH, adapter_name="writing")
 print("✅ 글쓰기 어댑터 로드 완료")
 
-# 교과 어댑터는 LoRA(r=16, 7개 target_modules)라 개당 166MB — 4개 추가로 약 667MB 증가.
-# 4bit 베이스(~6GB)와 합쳐도 7GB 수준이라 16GB GPU에서는 여유가 있다.
-# 하나라도 실패하면 해당 과목만 Ollama fallback으로 떨어지고 서버 기동은 계속한다.
+# 교과 어댑터(korean/english/science/social)는 **로드하지 않는다.**
+#
+# 쓰이던 곳이 _concept_explain() 하나뿐이었는데, 거기서 베이스가 더 낫다는 것이
+# 측정으로 확인돼 전 과목 베이스로 돌렸다(_CONCEPT_USE_BASE 참고). 그래서 지금은
+# 올려두기만 하고 호출되지 않는다. 개당 166MB, 4개면 약 668MB의 VRAM과
+# 기동 시간을 그냥 쓴다.
+#
+# 프롬프트를 학습 형식([학습 지문]/[교육과정 성취기준]/질문:)에 맞추면 회복될까
+# 싶어 재봤지만 오히려 격차가 벌어졌다(개념F1 기준 베이스-어댑터 차이가
+# +0.070 → +0.105, 4과목 모두 유의). 학습 형식을 주니 학습한 대로 더 짧은
+# 교과서 답안을 내놓는다 — 출력이 112자에서 68자로 줄었다. 개념 설명은
+# 그 어댑터들이 학습한 과제가 아니다.
+#
+# 어댑터 파일은 train/에 그대로 있으므로 아래를 True로 바꾸면 되돌릴 수 있다.
+LOAD_SUBJECT_ADAPTERS = False
+
 _LOADED_SUBJECT_ADAPTERS: set[str] = set()
-for _subject, (_adapter_name, _adapter_path, _) in SUBJECT_ADAPTERS.items():
-    try:
-        print(f"📥 {_subject} 어댑터 로드 중...")
-        base_model.load_adapter(_adapter_path, adapter_name=_adapter_name)
-        _LOADED_SUBJECT_ADAPTERS.add(_subject)
-        print(f"✅ {_subject} 어댑터 로드 완료")
-    except Exception as _e:
-        print(f"⚠️ {_subject} 어댑터 로드 실패 — Ollama fallback 사용: {_e}")
+if LOAD_SUBJECT_ADAPTERS:
+    # 하나라도 실패하면 해당 과목만 Ollama fallback으로 떨어지고 기동은 계속한다.
+    for _subject, (_adapter_name, _adapter_path, _) in SUBJECT_ADAPTERS.items():
+        try:
+            print(f"📥 {_subject} 어댑터 로드 중...")
+            base_model.load_adapter(_adapter_path, adapter_name=_adapter_name)
+            _LOADED_SUBJECT_ADAPTERS.add(_subject)
+            print(f"✅ {_subject} 어댑터 로드 완료")
+        except Exception as _e:
+            print(f"⚠️ {_subject} 어댑터 로드 실패 — Ollama fallback 사용: {_e}")
+else:
+    print("ℹ️ 교과 어댑터 4개는 로드하지 않습니다 (개념 설명은 베이스 사용, 약 668MB 절약)")
 
 base_model.set_adapter("math")
 
