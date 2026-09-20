@@ -134,6 +134,32 @@ def f1(cov: float, den: float) -> float:
     return 2 * cov * den / (cov + den) if cov + den else 0.0
 
 
+def paired_bootstrap(diffs: list[float], n_boot: int = 20000,
+                     seed: int = 0) -> tuple[float, float, float, float]:
+    """짝지은 차이의 평균과 95% 신뢰구간, 그리고 차이가 0보다 클 비율.
+
+    어댑터와 베이스를 **같은 개념**으로 재므로 표본이 독립이 아니다. 평균만
+    나란히 놓고 보면 과목당 14~22개뿐인 표본에서 우연을 실력으로 읽기 쉽다.
+    수학 CoT 비교에서 n=100 결론이 n=300에서 뒤집힌 적이 있어, 여기서는
+    처음부터 짝지어 검정한다.
+
+    개념별 차이를 복원추출로 재표집해 평균의 분포를 만든다. 분포가 0을
+    포함하면 "베이스가 낫다"고 말할 근거가 없다는 뜻이다.
+    """
+    if not diffs:
+        return 0.0, 0.0, 0.0, 0.0
+    rng = random.Random(seed)
+    n = len(diffs)
+    means = []
+    for _ in range(n_boot):
+        means.append(sum(diffs[rng.randrange(n)] for _ in range(n)) / n)
+    means.sort()
+    lo = means[int(0.025 * n_boot)]
+    hi = means[int(0.975 * n_boot)]
+    frac = sum(1 for m in means if m > 0) / n_boot
+    return sum(diffs) / n, lo, hi, frac
+
+
 def char_f1(pred: str, ref: str) -> float:
     p = Counter(c for c in pred if not c.isspace())
     r = Counter(c for c in ref if not c.isspace())
@@ -315,6 +341,33 @@ def main():
     row("전체", None)
     print("\n커버리지=참조 용어를 얼마나 덮었나(길수록 유리) / 밀도=꺼낸 용어 중 맞은 비율"
           "(길수록 불리)\n개념F1=둘의 조화평균, 길이에 중립적인 요약 지표")
+
+    # ── 짝지은 검정 ───────────────────────────────────────────────────────────
+    # 같은 개념으로 두 조건을 쟀으므로 평균 비교가 아니라 개념별 차이를 봐야 한다.
+    print("\n" + "=" * 86)
+    print("개념F1 짝지은 비교 (베이스 - 어댑터, 개념별 차이의 부트스트랩)")
+    print("=" * 86)
+    print(f"{'과목':<8}{'n':>4}{'평균차':>10}{'95% 신뢰구간':>22}{'베이스 우세':>12}  판정")
+    print("-" * 86)
+
+    def paired_row(label: str, subject: str | None) -> None:
+        pairs: dict[str, dict[str, float]] = {}
+        for r in rows:
+            if subject is not None and r["subject"] != subject:
+                continue
+            pairs.setdefault(f'{r["subject"]}|{r["concept"]}', {})[r["kind"]] = r["cf1"]
+        diffs = [v["base"] - v["adapter"] for v in pairs.values()
+                 if "base" in v and "adapter" in v]
+        m, lo, hi, frac = paired_bootstrap(diffs)
+        verdict = "베이스 우세" if lo > 0 else ("어댑터 우세" if hi < 0 else "구분 안 됨")
+        print(f"{label:<8}{len(diffs):>4}{m:>+10.3f}"
+              f"{f'[{lo:+.3f}, {hi:+.3f}]':>22}{frac:>11.1%}  {verdict}")
+
+    for subject in eval_set:
+        paired_row(subject, subject)
+    print("-" * 86)
+    paired_row("전체", None)
+    print("신뢰구간이 0을 포함하면 우열을 말할 근거가 없다는 뜻이다.")
 
     print("\n" + "=" * 86)
     print("생성 건전성 (어댑터 / 베이스)")
