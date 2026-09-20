@@ -43,6 +43,7 @@ _concept_explain() — 개념 설명 생성이다. 그런데 지금까지 정량
     python test_concept_explain_eval.py --greedy             # 재현 가능한 결정적 디코딩
 """
 import argparse
+import json
 import random
 import re
 import sys
@@ -197,11 +198,30 @@ def build_eval_set(subjects: list[str], n: int) -> dict[str, list[tuple[str, str
     return out
 
 
-def generate(model, tokenizer, subject_prompt: str, concept: str, greedy: bool) -> str:
+def build_user_msg(concept: str, passages: list[str] | None) -> str:
+    """사용자 메시지. passages가 있으면 교과 어댑터의 **학습 형식**으로 만든다.
+
+    교과 어댑터는 `[학습 지문] / [교육과정 성취기준] / 질문:` 형식으로 학습됐는데
+    서빙의 _concept_explain()은 질문만 보낸다. 이 불일치가 어댑터 성능 저하의
+    원인인지 확인하려고 학습 형식을 재현해 본다.
+
+    지문은 FAISS에서 검색하되 ConceptMap으로 적재한 문서는 제외한다 —
+    그게 이 평가의 참조 답안이라 그대로 넣으면 정답이 프롬프트로 새어 들어간다.
+    """
+    if not passages:
+        return f"질문: '{concept}' 개념의 핵심 포인트를 학생에게 설명해주세요."
+    body = "\n".join(passages)
+    return (f"[학습 지문]\n{body}\n"
+            f"[교육과정 성취기준]\n{concept}\n"
+            f"질문: '{concept}' 개념의 핵심 포인트를 학생에게 설명해주세요.")
+
+
+def generate(model, tokenizer, subject_prompt: str, concept: str, greedy: bool,
+             passages: list[str] | None = None) -> str:
     """main.py의 _concept_explain()과 동일한 프롬프트·생성 설정."""
     messages = [
         {"role": "system", "content": subject_prompt},
-        {"role": "user", "content": f"질문: '{concept}' 개념의 핵심 포인트를 학생에게 설명해주세요."},
+        {"role": "user", "content": build_user_msg(concept, passages)},
     ]
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
@@ -226,7 +246,18 @@ def main():
     ap.add_argument("--greedy", action="store_true",
                     help="결정적 디코딩. 기본은 서빙과 같은 샘플링(seed 고정).")
     ap.add_argument("--show", type=int, default=3)
+    ap.add_argument("--passages", default=None,
+                    help="개념별 RAG 지문 JSON({'과목|개념': [지문...]}). 주면 프롬프트를 "
+                         "교과 어댑터의 학습 형식([학습 지문]/[성취기준]/질문:)으로 만든다. "
+                         "어댑터와 베이스 **양쪽 모두** 같은 지문을 받으므로 "
+                         "차이는 어댑터 효과만 남는다.")
     args = ap.parse_args()
+
+    passages: dict[str, list[str]] = {}
+    if args.passages:
+        with open(args.passages, encoding="utf-8") as f:
+            passages = json.load(f)
+        print(f"RAG 지문 {len(passages)}개 개념 로드 — 학습 형식 프롬프트로 평가합니다.\n")
 
     # 한국사는 어댑터가 없어 _concept_explain이 None을 반환하고 Ollama로 폴백한다.
     # 어댑터 vs 베이스 비교 대상이 아니므로 기본 과목 목록에서 뺀다.
@@ -276,13 +307,15 @@ def main():
             wrong_ref = pool[(idx + 1) % len(pool)]
             wrong_terms = distinctive(wrong_ref, df, n_docs)
 
+            ps = passages.get(f"{subject}|{concept}") or None
+
             torch.manual_seed(SEED + idx)
             model.set_adapter(adapter_name)
-            pred_a = generate(model, tokenizer, system_prompt, concept, args.greedy)
+            pred_a = generate(model, tokenizer, system_prompt, concept, args.greedy, ps)
 
             torch.manual_seed(SEED + idx)
             with model.disable_adapter():
-                pred_b = generate(model, tokenizer, system_prompt, concept, args.greedy)
+                pred_b = generate(model, tokenizer, system_prompt, concept, args.greedy, ps)
 
             for kind, pred in (("adapter", pred_a), ("base", pred_b)):
                 cov = coverage(pred, key_terms)
