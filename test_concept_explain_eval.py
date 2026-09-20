@@ -76,8 +76,13 @@ _ANSWER_FMT = re.compile(r"정답\s*[:：]")
 MAX_DF_RATIO = 0.08
 
 
+# 참조는 유니코드 아래첨자를 쓰고(CO₂, H₂O) 모델은 보통 ASCII로 쓴다(CO2, H2O).
+# 정규화하지 않으면 _TERM이 'CO'와 'CO2'로 다르게 쪼개 같은 말이 안 맞는다.
+_SUBSUP = str.maketrans("₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹", "01234567890123456789")
+
+
 def terms(text: str) -> set[str]:
-    return set(_TERM.findall(text))
+    return set(_TERM.findall(text.translate(_SUBSUP)))
 
 
 def build_df(entries: list[str]) -> Counter:
@@ -95,9 +100,38 @@ def distinctive(ref: str, df: Counter, n_docs: int) -> set[str]:
 
 
 def coverage(pred: str, key_terms: set[str]) -> float:
+    """참조의 변별 용어 중 생성문에 나온 비율 (재현율 성격)."""
     if not key_terms:
         return 0.0
     return sum(1 for t in key_terms if t in pred) / len(key_terms)
+
+
+def density(pred: str, key_terms: set[str], df: Counter, n_docs: int) -> float:
+    """생성문의 변별 용어 중 참조와 겹치는 비율 (정밀도 성격).
+
+    커버리지만 보면 길이가 곧 점수가 된다. 짧고 정확한 설명이 길고 산만한
+    설명보다 낮게 나온다. 실제로 영어 어댑터는 학습 답안이 중앙값 20자라
+    한 문장만 내놓는데, 그 한 문장이 맞아도 121자짜리 참조는 못 덮는다.
+
+    그래서 방향을 뒤집은 지표를 같이 본다 — 모델이 꺼낸 개념어 중 몇 %가
+    참조에 있는가. 길게 늘어놓을수록 오히려 불리해지므로 커버리지와
+    반대 방향의 압력이 걸리고, 둘을 함께 보면 '짧아서 낮은 것'과
+    '틀려서 낮은 것'이 갈린다.
+    """
+    cut = max(1, int(n_docs * MAX_DF_RATIO))
+    # df >= 1 조건이 반드시 필요하다. ConceptMap에 아예 없는 말은 df가 0이라
+    # df <= cut을 그냥 통과해서, "만들고"·"내놓는" 같은 일반어가 전부 변별 용어로
+    # 잡힌다. 그러면 분모만 부풀어 밀도가 늘 0에 붙는다. 참조 쪽은 자기 문서에
+    # 들어있어 df >= 1이라 이 문제가 드러나지 않았다.
+    pred_terms = {t for t in terms(pred) if 1 <= df[t] <= cut}
+    if not pred_terms:
+        return 0.0
+    return len(pred_terms & key_terms) / len(pred_terms)
+
+
+def f1(cov: float, den: float) -> float:
+    """커버리지(재현율)와 밀도(정밀도)의 조화평균. 길이에 중립적인 요약 지표."""
+    return 2 * cov * den / (cov + den) if cov + den else 0.0
 
 
 def char_f1(pred: str, ref: str) -> float:
@@ -225,9 +259,13 @@ def main():
                 pred_b = generate(model, tokenizer, system_prompt, concept, args.greedy)
 
             for kind, pred in (("adapter", pred_a), ("base", pred_b)):
+                cov = coverage(pred, key_terms)
+                den = density(pred, key_terms, df, n_docs)
                 rows.append({
                     "subject": subject, "kind": kind, "concept": concept,
-                    "cov": coverage(pred, key_terms),
+                    "cov": cov,
+                    "den": den,
+                    "cf1": f1(cov, den),
                     "cov_wrong": coverage(pred, wrong_terms),
                     "f1": char_f1(pred, ref),
                     "ko": hangul_ratio(pred),
@@ -260,20 +298,23 @@ def main():
     print("\n" + "=" * 86)
     print("개념 설명 품질 — 과목별 (변별력 Δ = 정답참조 커버리지 - 무작위참조 커버리지)")
     print("=" * 86)
-    print(f"{'과목':<8}{'커버리지(A/B)':>20}{'무작위(A)':>12}{'변별력Δ(A/B)':>20}{'char-F1(A/B)':>18}")
+    print(f"{'과목':<8}{'커버리지(A/B)':>19}{'밀도(A/B)':>19}{'개념F1(A/B)':>19}{'변별력Δ(A/B)':>19}")
     print("-" * 86)
-    for subject in eval_set:
+
+    def row(label: str, subject: str | None) -> None:
         ca, cb = agg(subject, "adapter", "cov"), agg(subject, "base", "cov")
+        da, db = agg(subject, "adapter", "den"), agg(subject, "base", "den")
+        ha, hb = agg(subject, "adapter", "cf1"), agg(subject, "base", "cf1")
         wa, wb = agg(subject, "adapter", "cov_wrong"), agg(subject, "base", "cov_wrong")
-        fa, fb = agg(subject, "adapter", "f1"), agg(subject, "base", "f1")
-        print(f"{subject:<8}{ca:>9.3f} /{cb:>7.3f}{wa:>12.3f}"
-              f"{ca - wa:>10.3f} /{cb - wb:>7.3f}{fa:>10.3f} /{fb:>7.3f}")
+        print(f"{label:<8}{ca:>9.3f} /{cb:>7.3f}{da:>10.3f} /{db:>7.3f}"
+              f"{ha:>10.3f} /{hb:>7.3f}{ca - wa:>10.3f} /{cb - wb:>7.3f}")
+
+    for subject in eval_set:
+        row(subject, subject)
     print("-" * 86)
-    ca, cb = agg(None, "adapter", "cov"), agg(None, "base", "cov")
-    wa, wb = agg(None, "adapter", "cov_wrong"), agg(None, "base", "cov_wrong")
-    fa, fb = agg(None, "adapter", "f1"), agg(None, "base", "f1")
-    print(f"{'전체':<8}{ca:>9.3f} /{cb:>7.3f}{wa:>12.3f}"
-          f"{ca - wa:>10.3f} /{cb - wb:>7.3f}{fa:>10.3f} /{fb:>7.3f}")
+    row("전체", None)
+    print("\n커버리지=참조 용어를 얼마나 덮었나(길수록 유리) / 밀도=꺼낸 용어 중 맞은 비율"
+          "(길수록 불리)\n개념F1=둘의 조화평균, 길이에 중립적인 요약 지표")
 
     print("\n" + "=" * 86)
     print("생성 건전성 (어댑터 / 베이스)")
