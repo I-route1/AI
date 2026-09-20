@@ -72,6 +72,27 @@ def _load_index():
 
 _load_index()
 
+# ── 과목별 문서 인덱스 ─────────────────────────────────────────────────────────
+# 과목 한정 검색용. 예전에는 전역 상위 30건을 가져와서 과목 필터를 걸었는데,
+# 한국사처럼 문서가 적은 과목(98건 / 698,432건)은 상위 30에 들 일이 없어
+# 사실상 검색이 안 됐다. FAISS IDSelector로 해당 과목 문서만 놓고 찾으면
+# 그 문제가 없어지고, 대상이 줄어 오히려 빠르다(한국사 2ms vs 전역 74ms).
+_subject_ids: dict[str, np.ndarray] = {}
+
+
+def _build_subject_ids() -> None:
+    if not _doc_texts:
+        return
+    for subject, patterns in _SUBJECT_PATH_PATTERNS.items():
+        ids = [i for i, t in enumerate(_doc_texts) if any(p in t for p in patterns)]
+        if ids:
+            _subject_ids[subject] = np.array(ids, dtype="int64")
+    print("[FAISS] 과목별 문서: "
+          + ", ".join(f"{s} {len(v)}" for s, v in _subject_ids.items()))
+
+
+# 실제 호출은 _SUBJECT_PATH_PATTERNS가 정의된 뒤에 한다(파일 아래쪽).
+
 # ── 임베딩 모델 로드 ───────────────────────────────────────────────────────────
 try:
     from sentence_transformers import SentenceTransformer as _ST
@@ -99,13 +120,25 @@ _SUBJECT_PATH_PATTERNS: dict[str, list[str]] = {
     "수학":   ["_03.수학_", ".수학_"],
     "영어":   ["_02.영어_", ".영어_"],
     "국어":   ["_01.국어_", ".국어_"],
-    "과학":   ["_04.과학_", ".과학_"],
-    "사회":   ["_05.사회_", ".사회_"],
+    # 과학과 사회의 번호가 서로 바뀌어 있었다(과학은 _05, 사회는 _04).
+    # 두 번째 패턴이 받아내서 동작은 했지만 첫 패턴은 0건이었다.
+    "과학":   ["_05.과학_", ".과학_"],
+    "사회":   ["_04.사회_", ".사회_"],
     "한국사": ["한국사"],
 }
 # FAISS 벡터 검색을 건너뛰고 ConceptMap만 쓰는 과목.
-# AI-Hub 교육과정 코퍼스에 해당 과목 문서가 사실상 없어 검색 결과가 오히려 오염된다.
-_FAISS_EXCLUDED_SUBJECTS: frozenset[str] = frozenset({"한국사"})
+#
+# 한국사가 여기 있었다. 코퍼스에 13건뿐이라 검색이 오염됐기 때문인데,
+# scripts/ingest_rag_docs.py로 ConceptMap 42개 항목을 청크로 나눠 85건 적재해
+# 98건이 됐고, 아래 과목 한정 검색이 들어가면서 상황이 달라졌다.
+# 같은 42개 질의로 상위 3건 안에 질의어가 들어오는 비율을 재보면
+#   FAISS 과목 한정 + 청크 분할 : 81%
+#   _concept_map_semantic      : 33%
+# 로 뒤집힌다. _concept_map_semantic이 낮은 이유는 임베딩 모델이 128토큰에서
+# 잘라서 긴 항목의 뒷부분이 아예 안 보이기 때문이다. 청크로 나누면 그게 해결된다.
+_FAISS_EXCLUDED_SUBJECTS: frozenset[str] = frozenset()
+
+_build_subject_ids()
 
 _SUBJECT_KEYWORDS: dict[str, list[str]] = {
     "수학":   ["수학", "방정식", "함수", "수열", "확률", "기하", "미적분", "삼각", "벡터", "행렬", "정수", "집합"],
@@ -240,13 +273,30 @@ def subject_aware_search(subject: str, query: str, k: int = 3) -> list[str]:
 
     if _index is not None and _doc_texts:
         try:
-            enriched_query = f"{subject} 교육과정 {query} 개념 학습"
-            vec = _encode(enriched_query).astype(np.float32)
+            # 질의를 그대로 쓴다. 예전에는 f"{subject} 교육과정 {query} 개념 학습"으로
+            # 부풀렸는데, 임베딩 모델이 128토큰이라 짧은 질의에서는 붙인 일반어가
+            # 벡터를 지배해 '교육과정'을 논하는 엉뚱한 문서로 끌려갔다.
+            # ConceptMap 키워드 149개를 질의로 넣어 상위 3건에 질의어가 들어오는
+            # 비율을 재보면 원본 61% / 보강 37%로 원본이 낫다(한국사 81% vs 12%).
+            vec = _encode(query).astype(np.float32)
             faiss.normalize_L2(vec)
-            fetch_k = min(k * 10, len(_doc_texts))
-            _, indices = _index.search(vec, fetch_k)
+
+            ids = _subject_ids.get(subject)
+            if ids is not None and len(ids):
+                # 해당 과목 문서만 놓고 찾는다. 전역에서 뽑아 거르면 문서 수가 적은
+                # 과목은 후보에 아예 못 든다.
+                selector = faiss.IDSelectorBatch(ids)
+                params = faiss.SearchParameters()
+                params.sel = selector
+                fetch_k = min(k * 5, len(ids))
+                _, indices = _index.search(vec, fetch_k, params=params)
+            else:
+                fetch_k = min(k * 10, len(_doc_texts))
+                _, indices = _index.search(vec, fetch_k)
             candidates = [_doc_texts[i] for i in indices[0] if 0 <= i < len(_doc_texts)]
 
+            # IDSelector가 이미 걸렀으므로 보통 그대로 통과한다. 과목 인덱스가
+            # 없는 경우(전역 검색으로 빠진 경우)를 위한 안전망으로 남겨둔다.
             filtered = _filter_by_subject(candidates, subject)
 
             query_words = set(re.sub(r'\s+', ' ', query).split())
