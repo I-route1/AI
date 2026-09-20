@@ -37,6 +37,19 @@ class EvaluateResponse(BaseModel):
     matched_keywords: List[str]
     missing_keywords: List[str]
     deep_analysis: DeepAnalysis
+    # 파인튜닝 채점기의 의견. **final_score에는 영향을 주지 않는다.**
+    #
+    # final_score는 키워드 일치율 70% + 길이 비율 30%의 규칙 기반이다. 한편
+    # writing 어댑터는 사람 채점과 QWK 0.54로 일치하는 1~4점 채점기인데
+    # (test_writing_grading_eval.py, 777건) 지금까지 피드백 문장 생성에만
+    # 쓰이고 채점에는 호출되지 않았다.
+    #
+    # 바로 갈아끼우지 않는 이유: 1~4점을 0~100점으로 어떻게 매핑할지, 기존
+    # 점수 분포와의 호환을 어떻게 할지가 정해져야 하고 그건 실제 학생 점수가
+    # 바뀌는 일이다. 그래서 우선 두 점수를 나란히 실어 보내 실제 트래픽에서
+    # 비교할 수 있게 한다. 기존 필드는 그대로라 하위 호환이 깨지지 않는다.
+    llm_score: Optional[int] = None        # 1~4 반올림값
+    llm_score_raw: Optional[float] = None  # 반올림 전 기댓값 (상관분석용)
 
 
 class IrtItem(BaseModel):
@@ -253,6 +266,51 @@ def _llm_feedback(request: Request, question: str, model_answer: str,
         return None, None
 
 
+# 채점 라벨 공간. 학습 14,223건·평가 777건 모두 5점이 0건이라 실제로는 1~4다.
+# system 프롬프트는 "1점부터 5점"이라고 말하지만 모델이 5를 낼 일은 없다.
+_GRADE_SCALE = (1, 2, 3, 4)
+
+
+def _llm_grade(request: Request, question: str, user_answer: str) -> tuple[Optional[int], Optional[float]]:
+    """writing 어댑터로 1~4점 채점. (반올림값, 기댓값). 실패 시 (None, None).
+
+    generate()로 한 글자를 뽑지 않고 점수 토큰의 로짓을 직접 읽어 기댓값을 낸다.
+    순서형 점수에는 argmax보다 기댓값이 낫다 — 같은 어댑터로 QWK가
+    0.543 -> 0.553, 정확도가 56.9% -> 58.7%로 올랐다(777건 측정).
+    순전파 한 번이라 생성보다 오히려 싸다.
+
+    프롬프트는 학습 형식(train/preprocess_writing_qwen.py)과 글자 단위로 같아야 한다.
+    """
+    try:
+        model     = request.app.state.writing_model
+        tokenizer = request.app.state.writing_tokenizer
+        model.set_adapter("writing")
+
+        messages = [
+            {"role": "system",
+             "content": "제시된 지시문을 바탕으로 학생의 답안을 평가하여 1점부터 5점 사이의 숫자 점수만 출력하시오."},
+            {"role": "user",
+             "content": f"[지시문]: {question}\n[학생 답안]: {user_answer}"},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=896).to("cuda")
+        with torch.no_grad():
+            logits = model(**inputs).logits[0, -1, :].float()
+
+        ids = [tokenizer.encode(str(c), add_special_tokens=False) for c in _GRADE_SCALE]
+        if any(len(i) != 1 for i in ids):
+            return None, None
+        vec = torch.tensor([logits[i[0]] for i in ids])
+        probs = torch.softmax(vec, dim=0)
+        expected = float((probs * torch.tensor(_GRADE_SCALE, dtype=probs.dtype)).sum())
+        rounded = int(min(_GRADE_SCALE[-1], max(_GRADE_SCALE[0], round(expected))))
+        return rounded, round(expected, 3)
+    except Exception:
+        return None, None
+
+
 # ──────────────── Endpoints ────────────────
 
 @router.post("/evaluate", response_model=EvaluateResponse)
@@ -296,6 +354,9 @@ async def evaluate(request: Request, req: EvaluateRequest):
         if missing else "잘 작성했습니다."
     )
 
+    # 파인튜닝 채점기의 의견을 함께 실어 보낸다. final_score는 건드리지 않는다.
+    llm_score, llm_score_raw = _llm_grade(request, req.question_text, req.user_answer)
+
     return EvaluateResponse(
         keyword_score=kw_score if req.keywords else None,
         raw_score=raw_score,
@@ -311,6 +372,8 @@ async def evaluate(request: Request, req: EvaluateRequest):
             analysis=f"총 {len(req.keywords)}개 키워드 중 {len(matched)}개 포함",
             improvement=improvement,
         ),
+        llm_score=llm_score,
+        llm_score_raw=llm_score_raw,
     )
 
 
