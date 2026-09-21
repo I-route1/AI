@@ -116,7 +116,44 @@ def near_duplicates(thresholds=(0.95, 0.9, 0.8)) -> None:
         print(f"  유사도 >= {t}: {c}건 ({c / n:.1%})")
 
 
+def write_exclusion(out_path: str, threshold: float = 0.9) -> None:
+    """71859 평가 문항과 비슷한 71718 학습 문항의 id 목록을 쓴다.
+
+    near_duplicates()는 '평가 문항마다 가장 가까운 학습 문항'을 찾는다. 학습에서 빼야
+    할 것은 그 반대 방향, 즉 '평가 문항과 비슷한 학습 문항'이라서 같은 유사도 행렬을
+    학습 문항 기준으로 다시 훑는다. 평가 문항 하나가 학습 문항 여러 개와 비슷할 수 있다.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    eval_q = list(load_71859("VL_").keys())
+    b = "D:/수학 과목 문제생성 데이터"
+    pool, ids = [], []
+    for g in GRADES:
+        d = f"{b}/TL_1.문제_{g}"
+        for nm in os.listdir(d):
+            j = json.load(open(f"{d}/{nm}", encoding="utf-8-sig"))
+            qt = norm(j["OCR_info"][0].get("question_text") or "")
+            if len(qt) >= 8:
+                pool.append(qt)
+                ids.append(j["id"])
+    vec = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), min_df=2, dtype="float32")
+    P = vec.fit_transform(pool)
+    E = vec.transform(eval_q)
+    ET = E.T.tocsc()
+    flagged = []
+    step = 4000
+    for i in range(0, P.shape[0], step):
+        mx = (P[i:i + step] @ ET).max(axis=1).toarray().ravel()
+        flagged.extend(ids[i + k] for k, v in enumerate(mx) if v >= threshold)
+    json.dump(sorted(set(flagged)), open(out_path, "w", encoding="utf-8"), ensure_ascii=False)
+    print(f"71718 학습 {len(pool)}건 중 71859 평가 문항과 유사도 >= {threshold}: "
+          f"{len(set(flagged))}건 -> {out_path}")
+
+
 def main() -> None:
+    if "--write-exclusion" in sys.argv:
+        write_exclusion(sys.argv[sys.argv.index("--write-exclusion") + 1])
+        return
     eval_q = load_71859("VL_")
     train_q = load_71859("TL_")
     print(f"71859 읽지 못한 파일: {len(BROKEN)}건" + (f" (예: {BROKEN[0]})" if BROKEN else ""))
