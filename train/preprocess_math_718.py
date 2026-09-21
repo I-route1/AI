@@ -37,6 +37,8 @@ import sys
 from collections import Counter
 
 sys.stdout.reconfigure(encoding="utf-8")
+# train/ 안에서 직접 실행하면 프로젝트 루트가 경로에 없어 src를 못 찾는다.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 BASE = "D:/수학 과목 문제생성 데이터"
 GRADES = ["초등학교_3학년", "초등학교_4학년", "초등학교_5학년", "초등학교_6학년",
@@ -106,6 +108,10 @@ def build_answer(qtype: str, q_text: str, fa: str, fmt: str) -> tuple[str | None
         if val.count("$") % 2 == 1:
             return None, "보기 값의 수식 기호가 짝이 안 맞음"
         return f"정답: {val}", ""
+    # 단답형인데 정답 자체가 보기 번호인 문항(그림의 경로 번호, 표 안의 번호 등)은 값이 없다.
+    # 그림이 있어야 풀리는 문제이기도 해서 제외한다.
+    if re.match(r"^\s*[①②③④⑤]\s*$", fa):
+        return None, "정답이 번호뿐(그림/표 문항)"
     return f"정답: {fa}", ""
 
 
@@ -118,6 +124,10 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     ap.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않고 건수만 본다")
     ap.add_argument("--limit", type=int, default=None, help="학년별 최대 건수(시험용)")
+    ap.add_argument("--sample", type=int, default=None,
+                    help="정제를 모두 마친 뒤 무작위로 N건만 남긴다. --limit는 정렬된 앞부분만 자르므로 "
+                         "학년이 치우치지만 이건 전체에서 고르게 뽑는다.")
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--exclude-similar", default=None,
                     help="유사도 검사로 만든 제외 id 목록(JSON). 없으면 검사를 건너뛴다.")
     args = ap.parse_args()
@@ -172,7 +182,13 @@ def main() -> None:
             per_grade[g] += 1
 
     total = sum(drop.values()) + len(kept)
-    print(f"입력 {total}건 -> 사용 {len(kept)}건 ({len(kept) / max(total, 1):.1%})  [형식 {args.answer_format}]")
+    print(f"입력 {total}건 -> 정제 후 {len(kept)}건 ({len(kept) / max(total, 1):.1%})  [형식 {args.answer_format}]")
+    if args.sample and args.sample < len(kept):
+        import random
+        random.Random(args.seed).shuffle(kept)
+        kept = kept[:args.sample]
+        per_grade = Counter(r["grade"] for r in kept)
+        print(f"무작위 {args.sample}건 추출 (seed {args.seed})")
     print("제외 사유:")
     for k, v in drop.most_common():
         print(f"  {k:<28}{v:>7}건 ({v / total:.1%})")
