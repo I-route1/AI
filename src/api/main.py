@@ -241,8 +241,8 @@ def _strip_markdown(text: str) -> str:
 # 짧아서, 그 정확함이 커버리지 격차를 덮지 못한다.
 #
 # 결과적으로 개념 설명은 전 과목이 베이스를 쓴다. 과목 어댑터(korean/english/
-# science/social)는 이 경로에서만 쓰이던 것이라, 지금은 로드만 되고 실제로
-# 호출되지 않는다. VRAM과 기동 시간을 쓰므로 정리를 검토할 것.
+# science/social)는 이 경로에서만 쓰이던 것이라 로드하지 않는다
+# (LOAD_SUBJECT_ADAPTERS 참고).
 _CONCEPT_USE_BASE: frozenset[str] = frozenset(SUBJECT_ADAPTERS) | {"수학"}
 
 
@@ -340,7 +340,7 @@ async def generate_subject_recommendation(
         report += f"\n[관련 학습 자료]\n{rag_text}\n"
     report += f"\n[학습 전략]\n{strategy}"
 
-    # 파인튜닝된 과목 어댑터를 우선 쓰고, 어댑터가 없는 과목(한국사)만 Ollama로 넘긴다.
+    # 베이스 Qwen으로 생성하고, _concept_explain()이 None을 주는 과목만 Ollama로 넘긴다.
     # GPU 생성은 수 초가 걸리는 블로킹 작업이라 threadpool로 빼서 이벤트 루프를 막지 않는다.
     llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query)
 
