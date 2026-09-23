@@ -11,12 +11,14 @@ i-Route AI 서버가 서빙하는 모델과 학습 내역을 정리한 문서입
 ## 서빙 구조
 
 베이스 모델 **하나**에 LoRA 어댑터를 올려두고, 요청마다 `set_adapter()`로
-갈아끼웁니다. 어댑터는 6개를 학습했지만 **지금 로드하는 것은 2개**입니다.
+갈아끼웁니다. 어댑터는 6개를 학습했지만 **지금 로드하는 것은 math 하나**이고,
+그것도 `PeftModel`을 만들기 위한 것일 뿐 요청 경로에서는 쓰지 않습니다. 실제
+생성은 전부 베이스(`disable_adapter()`)나 Ollama가 합니다.
 
 ```
 unsloth/Qwen3-8B-unsloth-bnb-4bit  (4bit NF4, bf16 compute, double quant)
 ├── math     train/math_adapter_qwen              로드함 (PeftModel 생성용, 요청 경로에서는 안 씀)
-├── writing  train/writing_adapter_qwen_weighted  로드함 (/api/writing/* 전용)
+├── writing  train/writing_adapter_qwen_weighted  로드 안 함 (LOAD_WRITING_ADAPTER=False)
 ├── korean   train/korean_adapter_qwen            로드 안 함 (LOAD_SUBJECT_ADAPTERS=False)
 ├── english  train/english_adapter_qwen           〃
 ├── science  train/science_adapter_qwen           〃
@@ -36,8 +38,15 @@ Front(`I-route1/Front`)는 AI 서버를 직접 호출하지 않습니다.
 | `/api/ai/search`, `/api/rag/search` | RAG만 (생성 없음) |
 
 **`/api/writing/*`(evaluate·irt·curriculum·compare·weakness-report)는 어느
-클라이언트도 호출하지 않습니다.** 따라서 글쓰기 어댑터와 `llm_score` 필드도
-현재 제품에 닿지 않습니다. Backend의 `MathAiService`는 Ollama를 직접 부릅니다.
+클라이언트도 호출하지 않습니다.** Backend의 "writing"은 국어 리포트
+(`/api/ai/report/writing`)를 가리키는 이름이고, 서술형 답안을 제출받는 화면이나
+API는 Backend·Front 어디에도 없습니다. Backend의 `MathAiService`는 Ollama를 직접
+부릅니다.
+
+그래서 글쓰기 어댑터를 로드하지 않습니다(`LOAD_WRITING_ADAPTER=False`, 약 167MB).
+라우터는 그대로 살아 있어, `/api/writing/evaluate`는 규칙 기반 점수·피드백을 내고
+`llm_score`/`llm_score_raw`는 `None`입니다. 서술형 제출 기능이 생기면 `True`로
+바꾸면 됩니다.
 
 설정은 `src/api/adapters.py`에 모여 있고 `src/api/main.py`가 기동 시 로드합니다.
 
@@ -1250,9 +1259,10 @@ JSON은 UTF-8 BOM으로 시작해 `utf-8-sig`로 읽어야 합니다.
 
 ### 미해결
 
-- **`/api/writing/*`에 소비처가 없다** — Backend·Front 어디서도 호출하지 않는다.
-  글쓰기 어댑터(약 167MB VRAM)는 이 라우터 전용이라 역시 쓰이지 않는다.
-  Backend에 연결하거나 어댑터 로드를 끊는 것 중 하나를 정해야 한다.
+- **`/api/writing/*`에 소비처가 없다** — Backend·Front 어디서도 호출하지 않고,
+  서술형 답안을 제출받는 기능 자체가 없다. 글쓰기 어댑터 로드는 끊었다
+  (`LOAD_WRITING_ADAPTER=False`). 연결하려면 제출 화면·문항(모범답안·키워드)
+  관리·API를 새로 만들어야 하는 제품 결정이다.
 - **한국사만 개념 설명이 Ollama로 간다** — `_concept_explain()`이 한국사에
   `None`을 돌려줘서다. 다른 과목은 모두 베이스 Qwen을 쓰므로 한국사도 같은
   방식이 가능하다. 한국사 ConceptMap 42개로 측정한 뒤 전환할 것.
