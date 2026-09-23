@@ -37,7 +37,11 @@ DB의 기존 문서는 아래 형식이고, rag.py의 과목 필터(_SUBJECT_PAT
     #   (subject와 text만 필수)
     python scripts/ingest_rag_docs.py --from-jsonl data/new_docs.jsonl
 
+    # ConceptMap 항목을 고친 뒤 다시 적재 — 같은 출처(ConceptMap_한국사)의 옛 조각을 지우고 넣는다
+    python scripts/ingest_rag_docs.py --from-concept-map 한국사 --replace
+
     # 되돌리기: src/api/rag_db/ 의 .bak 파일을 원래 이름으로 되돌리면 된다.
+    # 이미 있던 .bak은 지우지 않고 .bak.<수정일> 로 이름을 바꿔 둔다.
 """
 import argparse
 import json
@@ -193,6 +197,10 @@ def main() -> None:
                      help="JSONL에서 가져온다. subject/text 필수, "
                           "keywords/standard/question/answer 선택.")
     ap.add_argument("--dry-run", action="store_true", help="DB를 건드리지 않고 결과만 본다")
+    ap.add_argument("--replace", action="store_true",
+                    help="넣을 문서와 같은 출처·과목([대상]{과목} (폴더: {출처}_{과목}))의 기존 문서를 "
+                         "먼저 지운다. 원문을 고친 뒤 다시 적재할 때 쓴다. 안 지우면 옛 조각이 남아 "
+                         "검색 결과에 고치기 전 내용이 섞인다.")
     ap.add_argument("--db", default=str(DB_DIR))
     ap.add_argument("--device", default="cpu",
                     help="임베딩 장치. 기본 cpu — 적재는 배치 작업이라 CPU로 충분하고, "
@@ -247,9 +255,39 @@ def main() -> None:
     if index.ntotal != len(index_to_id):
         raise SystemExit(f"인덱스({index.ntotal})와 매핑({len(index_to_id)}) 수가 다릅니다. 중단합니다.")
 
+    # ── 같은 출처의 기존 문서 제거 (--replace) ───────────────────────────────
+    removed = 0
+    dry_skip: set[str] = set()  # dry-run에서는 실제로 안 지우므로 중복 판정에서만 뺀다
+    if args.replace:
+        prefixes = tuple({f"[대상]{r['subject']} (폴더: {r.get('source', 'ingest')}_{r['subject']})"
+                          for r in records})
+        doomed = [i for i in sorted(index_to_id)
+                  if getattr(store[index_to_id[i]], "page_content", "").startswith(prefixes)]
+        removed = len(doomed)
+        print(f"--replace: 기존 문서 {removed}건 제거 대상 ({', '.join(prefixes)})")
+        if args.dry_run:
+            dry_skip = {index_to_id[i] for i in doomed}
+        elif doomed:
+            if not hasattr(index, "remove_ids") or not isinstance(index, faiss.IndexFlat):
+                raise SystemExit(f"{type(index).__name__}에서는 삭제를 지원하지 않습니다. 중단합니다.")
+            gone = set(doomed)
+            n = index.remove_ids(faiss.IDSelectorBatch(np.array(doomed, dtype="int64")))
+            if n != removed:
+                raise SystemExit(f"삭제 수 불일치: 요청 {removed} vs 실제 {n}. 저장하지 않고 중단합니다.")
+            # IndexFlat.remove_ids는 남은 벡터를 앞으로 당겨 번호를 다시 매긴다. 매핑도 같은
+            # 순서로 다시 매긴다.
+            kept_ids = [index_to_id[i] for i in sorted(index_to_id) if i not in gone]
+            for i in doomed:
+                del store[index_to_id[i]]
+            index_to_id.clear()
+            index_to_id.update(enumerate(kept_ids))
+            if index.ntotal != len(index_to_id):
+                raise SystemExit("삭제 후 인덱스와 매핑 수가 다릅니다. 저장하지 않고 중단합니다.")
+            print(f"  제거 완료. 벡터 {index.ntotal}개 / 문서 {len(store)}개")
+
     # ── 중복 제거 ────────────────────────────────────────────────────────────
     existing = {_passage(d.page_content if hasattr(d, "page_content") else str(d))
-                for d in store.values()}
+                for doc_id, d in store.items() if doc_id not in dry_skip}
     fresh: list[tuple[str, str]] = []
     dup = 0
     seen_in_batch = set()
@@ -262,7 +300,7 @@ def main() -> None:
         fresh.append((doc_text, embed_text))
     print(f"중복 제외 {dup}건 → 실제 추가 대상 {len(fresh)}건")
 
-    if not fresh:
+    if not fresh and not (removed and not args.dry_run):
         print("추가할 새 문서가 없습니다. DB를 건드리지 않고 종료합니다.")
         return
 
@@ -309,12 +347,17 @@ def main() -> None:
     for real, tmp in ((fi, ti), (fp, tp)):
         bak = real.with_suffix(real.suffix + ".bak")
         if bak.exists():
-            bak.unlink()
+            # 지우지 않는다. 처음 .bak은 적재 전 원본 DB라 되돌릴 유일한 길일 수 있다.
+            stamp = time.strftime("%Y%m%d%H%M%S", time.localtime(bak.stat().st_mtime))
+            bak.rename(bak.with_name(f"{bak.name}.{stamp}"))
         real.rename(bak)
         tmp.rename(real)
     print(f"저장 완료. 이전 버전은 {fi.name}.bak / {fp.name}.bak 로 남겨뒀습니다.")
 
     # ── 검증 ─────────────────────────────────────────────────────────────────
+    if not fresh:
+        print("\nAI 서버를 재시작해야 반영됩니다.")
+        return
     print("\n검증: 새로 넣은 문서가 실제로 검색되는지 확인")
     q = model.encode([fresh[0][1]]).astype(np.float32)
     faiss.normalize_L2(q)
