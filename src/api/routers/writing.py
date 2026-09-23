@@ -197,8 +197,10 @@ def _theta_to_level(theta: float) -> str:
 def _llm_feedback(request: Request, question: str, model_answer: str,
                   user_answer: str, missing: List[str], final_score: int) -> tuple[str, str]:
     """글쓰기 전용 모델(Qwen3-8B + writing 어댑터)로 LLM 피드백 생성. 실패 시 규칙 기반 fallback."""
+    model = request.app.state.writing_model
+    if model is None:
+        return None, None
     try:
-        model     = request.app.state.writing_model
         tokenizer = request.app.state.writing_tokenizer
         model.set_adapter("writing")
 
@@ -281,8 +283,10 @@ def _llm_grade(request: Request, question: str, user_answer: str) -> tuple[Optio
 
     프롬프트는 학습 형식(train/preprocess_writing_qwen.py)과 글자 단위로 같아야 한다.
     """
+    model = request.app.state.writing_model
+    if model is None:
+        return None, None
     try:
-        model     = request.app.state.writing_model
         tokenizer = request.app.state.writing_tokenizer
         model.set_adapter("writing")
 

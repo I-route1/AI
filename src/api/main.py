@@ -78,9 +78,17 @@ print("📥 수학 어댑터 로드 중...")
 base_model = PeftModel.from_pretrained(base_model, MATH_ADAPTER_PATH, adapter_name="math")
 print("✅ 수학 어댑터 로드 완료")
 
-print("📥 글쓰기 어댑터 로드 중...")
-base_model.load_adapter(WRITING_ADAPTER_PATH, adapter_name="writing")
-print("✅ 글쓰기 어댑터 로드 완료")
+# 글쓰기 어댑터는 /api/writing/* 전용인데, 그 라우터를 Backend·Front 어디서도
+# 호출하지 않는다(2026-09-23 확인). 서술형 답안을 제출받는 기능이 생기면 True로.
+# 꺼져 있으면 /api/writing/evaluate는 규칙 기반 피드백만 내고 llm_score는 None이다.
+LOAD_WRITING_ADAPTER = False
+
+if LOAD_WRITING_ADAPTER:
+    print("📥 글쓰기 어댑터 로드 중...")
+    base_model.load_adapter(WRITING_ADAPTER_PATH, adapter_name="writing")
+    print("✅ 글쓰기 어댑터 로드 완료")
+else:
+    print("ℹ️ 글쓰기 어댑터는 로드하지 않습니다 (/api/writing 소비처 없음, 약 167MB 절약)")
 
 # 교과 어댑터(korean/english/science/social)는 **로드하지 않는다.**
 #
@@ -117,7 +125,7 @@ base_model.set_adapter("math")
 app.state.model     = base_model
 app.state.tokenizer = tokenizer
 # math/writing 라우터가 같은 베이스 모델을 공유 - 호출 전 각자 set_adapter()로 전환한다.
-app.state.writing_model     = base_model
+app.state.writing_model     = base_model if LOAD_WRITING_ADAPTER else None
 app.state.writing_tokenizer = tokenizer
 
 
