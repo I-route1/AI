@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
 from src.api import model_registry
+from src.api.grounding import context_block
 from src.api.routers.rag import subject_aware_search, vector_search, _SUBJECT_KEYWORDS
 
 router = APIRouter()
@@ -49,7 +50,8 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
                     "model": "llama3.1:latest",
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"num_predict": 150, "temperature": 0.4},
+                    # num_ctx: 참고 자료가 붙으면 한국어가 2천 토큰 가까이 된다.
+                    "options": {"num_predict": 150, "temperature": 0.4, "num_ctx": 4096},
                 },
                 timeout=timeout,
             )
@@ -76,7 +78,8 @@ def _study_intensity(hours: float) -> str:
     return "학습량 매우 부족"
 
 
-def _math_report(req: dict) -> dict:
+def _math_report(req: dict) -> tuple[dict, list[str]]:
+    """(리포트, 검색한 RAG 자료). 자료는 LLM 문단의 근거로 다시 쓴다."""
     student_id     = req.get("studentId", "")
     percentile     = float(req.get("currentKoreanGrade") or 50)
     study_hours    = float(req.get("studyTime") or 1)
@@ -122,11 +125,12 @@ def _math_report(req: dict) -> dict:
         "title": "수학 메타인지 분석 리포트",
         "careerAnalysis": career_analysis,
         "learningGuide": learning_guide,
-    }
+    }, rag_docs
 
 
-def _subject_report(subject: str, req: dict) -> dict:
-    """전 과목 공용 메타인지 분석 리포트 (수학 리포트와 동일한 형식을 과목별로 일반화)."""
+def _subject_report(subject: str, req: dict) -> tuple[dict, list[str]]:
+    """전 과목 공용 메타인지 분석 리포트 (수학 리포트와 동일한 형식을 과목별로 일반화).
+    (리포트, 검색한 RAG 자료)를 돌려준다. 자료는 LLM 문단의 근거로 다시 쓴다."""
     student_id     = req.get("studentId", "")
     percentile     = float(req.get("currentKoreanGrade") or 50)
     study_hours    = float(req.get("studyTime") or 1)
@@ -173,7 +177,7 @@ def _subject_report(subject: str, req: dict) -> dict:
         "title": f"{subject} 메타인지 분석 리포트",
         "careerAnalysis": career_analysis,
         "learningGuide": learning_guide,
-    }
+    }, rag_docs
 
 
 def _writing_report(req: dict) -> dict:
@@ -314,10 +318,11 @@ def _premium_report(req: dict) -> dict:
 
 @router.post("/report/math")
 async def report_math(req: dict):
-    result = _math_report(req)
+    result, rag_docs = _math_report(req)
     concept = req.get("recommendContext", "").strip()
     if concept:
         prompt = (
+            f"{context_block(rag_docs)}"
             f"한국 중고등학생이 수학 '{concept}' 개념을 어려워합니다. "
             f"이 개념에서 학생들이 가장 자주 하는 핵심 실수 1가지와 "
             f"그것을 극복하는 구체적인 학습 전략을 2~3문장으로 간결하게 한국어로 답해주세요."
@@ -368,19 +373,21 @@ async def report_subject(subject: str, req: dict):
     if subject not in _SUBJECT_KEYWORDS:
         raise HTTPException(status_code=404, detail=f"지원하지 않는 과목입니다: {subject}")
 
-    result = _subject_report(subject, req)
+    result, rag_docs = _subject_report(subject, req)
     concept = req.get("recommendContext", "").strip()
     if concept:
         # 1순위: main.py의 _concept_explain()(베이스 Qwen). main.py가 registry에 등록한다.
         # TestClient로 라우터만 띄운 경우처럼 미등록이면 곧바로 Ollama로 넘어간다.
+        # rag_docs는 concept으로 검색한 것이다(_subject_report가 recommendContext로 검색).
         llm_insight = None
         concept_explain = model_registry.get("concept_explain")
         if concept_explain:
-            llm_insight = await run_in_threadpool(concept_explain, subject, concept)
+            llm_insight = await run_in_threadpool(concept_explain, subject, concept, rag_docs)
 
         # 2순위: _concept_explain()이 None을 준 경우(한국사, 생성 실패) Ollama
         if not llm_insight:
             prompt = (
+                f"{context_block(rag_docs)}"
                 f"한국 중고등학생이 {subject} '{concept}' 개념을 어려워합니다. "
                 f"이 개념에서 학생들이 가장 자주 하는 핵심 실수 1가지와 "
                 f"그것을 극복하는 구체적인 학습 전략을 2~3문장으로 간결하게 한국어로 답해주세요."

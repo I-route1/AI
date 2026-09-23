@@ -37,6 +37,7 @@ from src.api.adapters import (
 from src.api.routers import counseling, predictor, writing, rag
 from src.api.routers.rag import subject_aware_search as _subject_aware_search
 from src.api.java_client import get_student_weakness_from_java
+from src.api.grounding import concept_user_message, context_block
 
 app = FastAPI(title="iRoute AI Server", default_response_class=UTF8JSONResponse)
 
@@ -158,7 +159,8 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
                     "model": "llama3.1:latest",
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"num_predict": 150, "temperature": 0.4},
+                    # num_ctx: 참고 자료가 붙으면 한국어가 2천 토큰 가까이 된다.
+                    "options": {"num_predict": 150, "temperature": 0.4, "num_ctx": 4096},
                 },
                 timeout=timeout,
             )
@@ -254,8 +256,11 @@ def _strip_markdown(text: str) -> str:
 _CONCEPT_USE_BASE: frozenset[str] = frozenset(SUBJECT_ADAPTERS) | {"수학"}
 
 
-def _concept_explain(subject: str, concept_query: str) -> str | None:
+def _concept_explain(subject: str, concept_query: str,
+                     context_docs: list[str] | None = None) -> str | None:
     """개념 설명 생성. 생성할 수 없으면 None(호출부에서 Ollama로 fallback).
+
+    context_docs: 호출부가 이미 검색한 RAG 자료. 주면 근거로 붙인다(grounding.py).
 
     과목마다 어댑터를 쓸지 베이스를 쓸지 다르다 — _CONCEPT_USE_BASE 참고.
     어댑터가 항상 나은 것이 아니라서, 과목별로 측정해 정한 값이다.
@@ -282,12 +287,14 @@ def _concept_explain(subject: str, concept_query: str) -> str | None:
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"질문: '{concept_query}' 개념의 핵심 포인트를 학생에게 설명해주세요."},
+            {"role": "user", "content": concept_user_message(concept_query, context_docs)},
         ]
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to("cuda")
+        # 참고 자료가 붙으면 입력이 1,000토큰을 넘을 수 있다. 오른쪽부터 잘리므로
+        # 한도가 모자라면 질문과 생성 프롬프트가 먼저 날아간다.
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to("cuda")
         input_len = inputs["input_ids"].shape[-1]
 
         def _gen():
@@ -350,10 +357,11 @@ async def generate_subject_recommendation(
 
     # 베이스 Qwen으로 생성하고, _concept_explain()이 None을 주는 과목만 Ollama로 넘긴다.
     # GPU 생성은 수 초가 걸리는 블로킹 작업이라 threadpool로 빼서 이벤트 루프를 막지 않는다.
-    llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query)
+    llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query, rag_docs)
 
     if not llm_insight:
         prompt = (
+            f"{context_block(rag_docs)}"
             f"{subject} 과목에서 '{concept_query}' 개념을 어려워하는 학생에게 "
             f"이 개념의 핵심 포인트와 효과적인 학습 방법을 2~3문장으로 한국어로 답해주세요."
         )
