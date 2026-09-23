@@ -12,6 +12,10 @@ Qwen 1.5→6/8, Ollama 3.5→6.5/8), FAISS 교과서 조각(40~120자 한 문장
 오히려 줄고(6.5→5/8) 중국어가 섞여 나왔다(0→4/8). 조각은 개념을 정의하지 못하는
 문장이 대부분이라 모델이 그 문장에 끌려간다. 한국사 FAISS 문서는 ConceptMap을
 잘라 적재한 것이라 이 판별에 그대로 걸린다.
+
+**FAISS 조각이 오면 첫 조각이 속한 항목 하나만 통째로 쓴다.** 키워드가 안 맞아 FAISS로
+넘어간 질의("군신 관계")는 서로 다른 항목의 조각 세 개가 섞여 오는데, 모델이 그중 무관한
+조각(훈구·사림)에 끌려 틀렸다. 조각은 문장 몇 개라 맥락도 빠져 있다.
 """
 import re
 
@@ -32,23 +36,44 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
-_CURATED = [_norm(v) for v in CONCEPT_MAP.values()]
+_ENTRIES = list(CONCEPT_MAP.values())
+_CURATED = [_norm(v) for v in _ENTRIES]
+
+
+def _parent(doc: str) -> int | None:
+    """doc을 담고 있는 ConceptMap 항목의 번호. 없으면 None."""
+    n = _norm(doc)
+    if not n:
+        return None
+    return next((i for i, e in enumerate(_CURATED) if n in e), None)
 
 
 def is_curated(doc: str) -> bool:
     """ConceptMap 항목 자체이거나 그 일부(한국사 FAISS 청크)인가."""
-    n = _norm(doc)
-    return bool(n) and any(n in e for e in _CURATED)
+    return _parent(doc) is not None
 
 
 def usable_docs(docs: list[str] | None) -> list[str]:
-    """근거로 쓸 자료만 남긴다 — ConceptMap 출처만(위 설명 참고)."""
-    out = []
+    """근거로 쓸 자료만 남긴다 — ConceptMap 출처만(위 설명 참고).
+
+    항목 전체가 온 경우(키워드 검색)는 그대로 최대 MAX_DOCS개. 항목의 일부 조각이 온
+    경우(FAISS)는 첫 조각이 속한 항목 하나만 통째로.
+    """
+    found = []
     for d in docs or []:
-        d = (d or "").strip()
-        if not is_curated(d):
-            continue
-        out.append(d[:MAX_DOC_CHARS])
+        i = _parent((d or "").strip())
+        if i is not None:
+            found.append((i, _norm(d) == _CURATED[i]))
+    if not found:
+        return []
+    first, whole = found[0]
+    if not whole:
+        return [_ENTRIES[first][:MAX_DOC_CHARS]]
+    out: list[str] = []
+    for i, _ in found:
+        entry = _ENTRIES[i][:MAX_DOC_CHARS]
+        if entry not in out:
+            out.append(entry)
         if len(out) >= MAX_DOCS:
             break
     return out
