@@ -371,14 +371,14 @@ async def report_subject(subject: str, req: dict):
     result = _subject_report(subject, req)
     concept = req.get("recommendContext", "").strip()
     if concept:
-        # 1순위: 파인튜닝된 과목 어댑터(국어/영어/과학/사회). main.py가 registry에 등록한다.
+        # 1순위: main.py의 _concept_explain()(베이스 Qwen). main.py가 registry에 등록한다.
         # TestClient로 라우터만 띄운 경우처럼 미등록이면 곧바로 Ollama로 넘어간다.
         llm_insight = None
         concept_explain = model_registry.get("concept_explain")
         if concept_explain:
             llm_insight = await run_in_threadpool(concept_explain, subject, concept)
 
-        # 2순위: 어댑터가 없는 과목(한국사) 또는 생성 실패 시 Ollama
+        # 2순위: _concept_explain()이 None을 준 경우(한국사, 생성 실패) Ollama
         if not llm_insight:
             prompt = (
                 f"한국 중고등학생이 {subject} '{concept}' 개념을 어려워합니다. "

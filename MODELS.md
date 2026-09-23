@@ -10,18 +10,34 @@ i-Route AI 서버가 서빙하는 모델과 학습 내역을 정리한 문서입
 
 ## 서빙 구조
 
-베이스 모델 **하나**에 LoRA 어댑터 6개를 모두 올려두고, 요청마다
-`set_adapter()`로 갈아끼웁니다.
+베이스 모델 **하나**에 LoRA 어댑터를 올려두고, 요청마다 `set_adapter()`로
+갈아끼웁니다. 어댑터는 6개를 학습했지만 **지금 로드하는 것은 2개**입니다.
 
 ```
 unsloth/Qwen3-8B-unsloth-bnb-4bit  (4bit NF4, bf16 compute, double quant)
-├── math     train/math_adapter_qwen
-├── writing  train/writing_adapter_qwen_weighted
-├── korean   train/korean_adapter_qwen
-├── english  train/english_adapter_qwen
-├── science  train/science_adapter_qwen
-└── social   train/social_adapter_qwen
+├── math     train/math_adapter_qwen              로드함 (PeftModel 생성용, 요청 경로에서는 안 씀)
+├── writing  train/writing_adapter_qwen_weighted  로드함 (/api/writing/* 전용)
+├── korean   train/korean_adapter_qwen            로드 안 함 (LOAD_SUBJECT_ADAPTERS=False)
+├── english  train/english_adapter_qwen           〃
+├── science  train/science_adapter_qwen           〃
+└── social   train/social_adapter_qwen            〃
 ```
+
+### 실제로 호출되는 경로 (2026-09-23, Backend·Front 코드 기준)
+
+Backend(`I-route1/Backend`)가 AI 서버에 보내는 요청과 각 요청이 쓰는 모델입니다.
+Front(`I-route1/Front`)는 AI 서버를 직접 호출하지 않습니다.
+
+| 경로 | 쓰는 모델 |
+|---|---|
+| `/api/ai/report/subject-recommend` | 베이스 Qwen (`_concept_explain`), 한국사만 Ollama |
+| `/api/ai/report/{영어·과학·사회·한국사}` | 베이스 Qwen (`_concept_explain`), 한국사만 Ollama |
+| `/api/ai/report/math`, `/report/writing`, `/report/premium` | 규칙 기반 + **Ollama** `llama3.1` |
+| `/api/ai/search`, `/api/rag/search` | RAG만 (생성 없음) |
+
+**`/api/writing/*`(evaluate·irt·curriculum·compare·weakness-report)는 어느
+클라이언트도 호출하지 않습니다.** 따라서 글쓰기 어댑터와 `llm_score` 필드도
+현재 제품에 닿지 않습니다. Backend의 `MathAiService`는 Ollama를 직접 부릅니다.
 
 설정은 `src/api/adapters.py`에 모여 있고 `src/api/main.py`가 기동 시 로드합니다.
 
@@ -264,7 +280,11 @@ llm_score_raw: Optional[float] = None  # 반올림 전 기댓값 (상관분석�
 ```
 
 기존 필드가 그대로라 하위 호환이 깨지지 않습니다. 실제 트래픽에서 두 점수를
-비교해본 뒤 교체 여부를 정하면 됩니다. 디코딩은 측정에서 더 나았던
+비교해본 뒤 교체 여부를 정하면 됩니다.
+
+> **2026-09-23 확인: 그 "실제 트래픽"이 없습니다.** Backend와 Front 모두
+> `/api/writing/*`를 호출하지 않아, `final_score`든 `llm_score`든 학생에게
+> 닿지 않습니다. 맨 위 "실제로 호출되는 경로" 참고. 디코딩은 측정에서 더 나았던
 기댓값 방식을 씁니다(순전파 1회라 생성보다 쌉니다).
 
 실제 호출 확인: 비속어 섞인 부실 답안 **1점**(기댓값 1.039), 논리적인
@@ -487,12 +507,6 @@ VRAM과 기동 시간**을 아낍니다. 어댑터 파일은 `train/`에 그대�
 곱셈 기호가 사라집니다**(`2*3=6` → `23=6`). 수학을 베이스로 돌리는
 이상 실제로 발생하는 문제라 이 구분이 필요합니다. LaTeX(`$y=a^{x}$`)와
 어댑터의 평문 출력은 손대지 않습니다.
-
-아직 안 해본 것: 프롬프트를 학습 형식(`[학습 지문]`·`[교육과정 성취기준]`)에
-맞추면 교과 어댑터가 회복되는지. 다만 이 평가에서 참조로 쓰는 ConceptMap이
-RAG 최상위 레이어라, 검색 결과를 지문으로 넣으면 정답이 프롬프트로 새어
-들어가 평가가 성립하지 않습니다. 지문을 FAISS 문서로만 제한하는 등
-설계를 따로 해야 합니다.
 
 ### 수학 어댑터
 
@@ -1048,10 +1062,17 @@ ConceptMap을 FAISS보다 우선하는 것은 의도된 설계입니다. 손으�
 
 ## Ollama 의존성
 
-어댑터가 없는 과목(한국사)과 어댑터 생성 실패 시 `localhost:11434`의
-`llama3.1:latest`로 폴백합니다. **Ollama가 없으면 에러 없이 조용히 해당
-섹션이 사라집니다** (`_ollama_analyze`가 `None`을 반환하고 호출부가 생략).
-리포트에 "AI 개념 분석"이 안 보이면 Ollama부터 확인하세요.
+Ollama(`localhost:11434`의 `llama3.1:latest`)는 폴백이 아니라 **주 경로**이기도
+합니다.
+
+- `/api/ai/report/math`, `/report/writing`, `/report/premium`의 LLM 문단은
+  **Ollama만** 씁니다.
+- 개념 설명(`_concept_explain`)은 한국사와 생성 실패 시 Ollama로 넘어갑니다.
+- Backend의 `MathAiService`도 Ollama를 직접 호출합니다.
+
+**Ollama가 없으면 에러 없이 조용히 해당 섹션이 사라집니다** (`_ollama_analyze`가
+`None`을 반환하고 호출부가 생략). 리포트에 "AI 개념 분석"이 안 보이면 Ollama부터
+확인하세요.
 
 ---
 
@@ -1217,9 +1238,9 @@ JSON은 UTF-8 BOM으로 시작해 `utf-8-sig`로 읽어야 합니다.
   어댑터가 나은 축도 있다: 밀도(꺼낸 개념어 중 맞은 비율)는 4과목에서
   어댑터가 앞선다. 짧지만 정확하되, 3배의 길이 차이를 덮지 못한다.
 - **교과 어댑터 4개가 서빙에서 쓰이지 않게 됐다** — `_concept_explain()`
-  에서만 쓰이던 것이라 이제 로드만 되고 호출되지 않는다. 개당 167MB,
-  합계 668MB의 VRAM과 기동 시간을 쓴다. 프롬프트를 학습 형식에 맞추는
-  실험을 하거나 접은 뒤 정리할 것.
+  에서만 쓰이던 것이다. 학습 형식 프롬프트로도 회복되지 않아
+  (격차 +0.070 → +0.105) **로드를 끊었다**(`LOAD_SUBJECT_ADAPTERS=False`,
+  약 668MB 절약).
 - **글쓰기 채점 능력이 서빙에서 쓰이지 않았다** — `/api/writing/evaluate`의
   점수는 키워드 일치율 70% + 길이 비율 30%의 규칙 기반이고, QWK 0.54의
   파인튜닝 채점기는 피드백 문장 생성에만 쓰였다.
@@ -1229,22 +1250,31 @@ JSON은 UTF-8 BOM으로 시작해 `utf-8-sig`로 읽어야 합니다.
 
 ### 미해결
 
+- **`/api/writing/*`에 소비처가 없다** — Backend·Front 어디서도 호출하지 않는다.
+  글쓰기 어댑터(약 167MB VRAM)는 이 라우터 전용이라 역시 쓰이지 않는다.
+  Backend에 연결하거나 어댑터 로드를 끊는 것 중 하나를 정해야 한다.
+- **한국사만 개념 설명이 Ollama로 간다** — `_concept_explain()`이 한국사에
+  `None`을 돌려줘서다. 다른 과목은 모두 베이스 Qwen을 쓰므로 한국사도 같은
+  방식이 가능하다. 한국사 ConceptMap 42개로 측정한 뒤 전환할 것.
 - `rpi/pose_hailo.py`의 `decode_keypoints()` 미구현 — **Hailo 실물 없이는
   진행 불가**. 추측으로 구현하면 예외 대신 '그럴듯하지만 틀린 좌표'가 나오고,
   그 값이 `classify_posture()`를 거쳐 백엔드 학습활동 기록까지 올라간다.
   Pi5에서 `describe_outputs()`로 텐서 형태를 확인하는 것이 선행 조건이다.
-- `_concept_explain()`의 프롬프트가 교과 어댑터 학습 형식과 불일치
-  (`[학습 지문]`·`[교육과정 성취기준]` 없이 질문만 전달). 이제 어댑터를
-  쓰는 과목은 국어뿐이라 영향 범위가 줄었다. 다만 이 평가는 ConceptMap을
-  참조로 쓰는데 그게 RAG 최상위 레이어라, 검색 결과를 지문으로 넣으면
-  정답이 프롬프트로 새어 들어간다. 지문을 FAISS 문서로만 제한하는 등
-  설계가 필요하다.
-- **국어 판정이 미확정** — 신뢰구간 [−0.017, +0.078]로 0을 포함한다.
-  ConceptMap 국어 항목이 16개뿐이라 이 평가셋으로는 더 좁힐 수 없다.
-  확정하려면 국어 개념 항목을 늘려야 한다.
-- 글쓰기 데이터에 **5점이 0건** — 학습 14,223건·평가 777건 모두. system
-  프롬프트는 "1점부터 5점"이라고 하지만 실제 라벨 공간은 1~4다.
-  `llm_score`도 1~4만 낸다.
+  지금은 `NotImplementedError`를 `rpi/pi_main.py`가 잡아 포즈만 건너뛰므로
+  틀린 값이 올라가지는 않는다.
 - **개념 설명 커버리지 지표가 길이에 휘둘린다** — 짧지만 옳은 답이 낮게
   나온다. 평균 출력 길이를 같이 찍게 해뒀지만, 길이로 정규화한 지표나
   요약 후 비교 같은 보완이 필요하다.
+- **AI-Hub 수학 데이터(71718·71716) 이용 조건 미확인** — 로컬에 약관 문서가
+  없다. 서빙하는 수학 어댑터가 없어 지금은 영향이 없다.
+
+### 서빙과 무관해져 보류한 것
+
+- **국어 개념 설명 판정 미확정** — 신뢰구간 [−0.017, +0.078]. 이미 베이스로
+  전환했고 교과 어댑터는 로드하지 않으므로, 어댑터를 되살릴 때만 의미가 있다.
+- **`_concept_explain()` 프롬프트와 교과 어댑터 학습 형식의 불일치** — 개념
+  설명에서 어댑터를 쓰는 과목이 더는 없다. 학습 형식으로 맞추는 실험도
+  이미 했다(격차가 오히려 벌어짐).
+- 글쓰기 데이터에 **5점이 0건** — 학습 14,223건·평가 777건 모두. system
+  프롬프트는 "1점부터 5점"이라고 하지만 실제 라벨 공간은 1~4다.
+  `llm_score`도 1~4만 낸다. `/api/writing/*`에 소비처가 없어 제품 영향은 없다.
