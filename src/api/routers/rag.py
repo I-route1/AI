@@ -122,6 +122,45 @@ _FAISS_EXCLUDED_SUBJECTS: frozenset[str] = frozenset()
 
 _build_subject_ids()
 
+
+def _check_concept_map_chunks() -> None:
+    """FAISS에 적재한 ConceptMap 조각이 지금의 ConceptMap과 맞는지 기동할 때 확인한다.
+
+    한국사는 ConceptMap을 조각내 FAISS에도 넣었다. 항목을 고치고 다시 적재하지 않으면
+    옛 조각은 근거 판별(grounding.is_curated)에서 빠지고, 고친 내용은 FAISS에 없다.
+    에러 없이 조용히 품질만 떨어지므로 로그로 알린다.
+    """
+    from src.api.grounding import is_curated
+
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", "", s)
+
+    by_subject: dict[str, list[str]] = {}
+    for t in _doc_texts:
+        m = re.match(r"\[대상\](\S+) \(폴더: ConceptMap_", t)
+        if not m:
+            continue
+        body = re.search(r"\[학습 지문\]\s*(.+?)(?=\n\[|$)", t, re.S)
+        by_subject.setdefault(m.group(1), []).append(norm(body.group(1)) if body else "")
+
+    for subject, chunks in by_subject.items():
+        stale = sum(1 for c in chunks if not is_curated(c))
+        missing = 0
+        for keys, text in _CONCEPT_MAP.items():
+            if keys[0] != subject:
+                continue
+            e = norm(text)
+            if sum(len(c) for c in chunks if c and c in e) < len(e):
+                missing += 1
+        if stale or missing:
+            # 이모지를 쓰지 않는다. rag를 직접 import하는 스크립트는 콘솔이 cp949일 수 있다.
+            print(f"[FAISS 경고] {subject} ConceptMap 조각이 현재 ConceptMap과 다릅니다 — "
+                  f"옛 조각 {stale}개, FAISS에 반영 안 된 항목 {missing}개. 다시 적재하세요: "
+                  f"python scripts/ingest_rag_docs.py --from-concept-map {subject} --replace")
+
+
+_check_concept_map_chunks()
+
 _SUBJECT_KEYWORDS: dict[str, list[str]] = {
     "수학":   ["수학", "방정식", "함수", "수열", "확률", "기하", "미적분", "삼각", "벡터", "행렬", "정수", "집합"],
     "영어":   ["영어", "English", "Grammar", "Reading", "Listening", "어법", "구문", "독해", "listening"],
