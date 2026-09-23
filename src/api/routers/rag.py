@@ -12,25 +12,7 @@ router = APIRouter()
 # rag.py는 import만 해도 FAISS와 임베딩 모델을 올리므로, 이 데이터만 필요한
 # 쪽(평가 스크립트 등)이 rag를 import하지 않아도 되게 하기 위해서다.
 from src.api.concept_map import CONCEPT_MAP as _CONCEPT_MAP
-
-
-def _kw_matches(kw: str, query: str) -> bool:
-    """한국어 단어 경계 고려 매칭 — '수열'이 '등비수열' 내에서 오매칭되지 않도록."""
-    return bool(re.search(r'(?<![가-힣A-Za-z0-9])' + re.escape(kw) + r'(?![가-힣A-Za-z0-9])', query))
-
-
-def _concept_map_search(subject: str, query: str, k: int) -> list[str]:
-    """키워드 직접 매핑에서 일치 항목 반환. FAISS보다 먼저 실행."""
-    query_lower = query.lower()
-    results = []
-    for keys, content in _CONCEPT_MAP.items():
-        if keys[0] != subject:
-            continue
-        if any(_kw_matches(kw, query) or _kw_matches(kw, query_lower) for kw in keys[1:]):
-            results.append(content)
-        if len(results) >= k:
-            break
-    return results
+from src.api.concept_map import search_concept_map as _concept_map_search
 
 # ── FAISS 인덱스 로드 ──────────────────────────────────────────────────────────
 _FAISS_DIR = Path("src/api/rag_db")

@@ -7,6 +7,7 @@ sentence-transformers 임베딩 모델을 로드한다. 이 딕셔너리만 필�
 
 서빙 동작은 그대로다. rag.py가 여기서 CONCEPT_MAP을 가져다 쓴다.
 """
+import re
 
 # ── 개념 키워드 직접 매핑 (FAISS 우선 레이어) ─────────────────────────────────
 # 키: (과목, 키워드들...) → 값: 설명 텍스트
@@ -49,13 +50,20 @@ CONCEPT_MAP: dict[tuple[str, ...], str] = {
     ("수학", "삼각형의 넓이", "헤론", "내접원"): "삼각형 넓이=½·a·b·sinC. 헤론 공식: s=(a+b+c)/2, S=√(s(s-a)(s-b)(s-c)). 외접원 반지름 R=abc/4S. 내접원 반지름 r=S/s.",
 
     # ── 영어 ──────────────────────────────────────────────────────────────────
-    ("영어", "관계대명사", "who", "which", "that"): "관계대명사: who(사람 주격/목적격), which(사물), that(사람·사물). 소유격 whose. 목적격 생략 가능. 계속적 용법(, who/which): 앞 절 전체 수식 불가. 관계부사: where/when/why/how.",
-    ("영어", "부정사", "to부정사"): "to부정사: 명사적(~것), 형용사적(~할), 부사적(~하기 위해). 원형부정사: 사역동사(make/let/have)+목적어+원형. 지각동사(see/hear/feel)+목적어+원형/~ing.",
+    ("영어", "관계대명사", "who", "which", "that"): "관계대명사: 앞의 명사(선행사)를 꾸미는 절을 이끈다. who(사람 주격)·whom(사람 목적격)·which(사물·동물)·that(사람·사물)·whose(소유격). 관계대명사 뒤에는 주어나 목적어가 빠진 불완전한 절이 온다. 목적격은 생략 가능(the book (which) I read). that을 쓸 수 없는 경우: 계속적 용법, 전치사 바로 뒤(the house in which I live). 계속적 용법(콤마+who/which): 선행사를 덧붙여 설명하며, which는 앞 절 전체도 받는다(He was late, which made me angry). 선행사에 최상급·서수·the only·all이 있으면 주로 that을 쓴다.",
+    ("영어", "관계대명사 what", "what절"): "관계대명사 what: 선행사를 포함해 the thing(s) which(~하는 것)의 뜻. what 앞에는 선행사가 오지 않는다. what절은 명사절로 주어·목적어·보어가 된다(What he said is true. / I believe what you told me. / This is what I want). what 뒤는 불완전한 절, 접속사 that 뒤는 완전한 절. 관용: what is called(이른바), what is more(게다가), A is to B what C is to D(A와 B의 관계는 C와 D의 관계와 같다).",
+    ("영어", "부정사", "to부정사"): "to부정사(to+동사원형): 명사적 용법(~하는 것: 주어·목적어·보어. To learn English is fun. / I want to learn English. / My dream is to be a doctor. 주어 자리에는 보통 가주어 it을 쓴다: It is fun to learn English), 형용사적 용법(~할: something to drink), 부사적 용법(목적 ~하기 위해·감정의 원인·결과·판단의 근거). want/hope/decide/plan/expect+to부정사. 원형부정사: 사역동사(make/let/have)+목적어+동사원형, 지각동사(see/hear/feel)+목적어+동사원형/~ing.",
+    ("영어", "가주어", "진주어", "가목적어"): "가주어 it: to부정사·that절 주어가 길면 뒤로 보내고 그 자리에 it을 둔다(It is important to exercise every day. / It is true that he lied). 뒤로 간 원래 주어를 진주어라 한다. 가목적어 it: 5형식에서 목적어가 to부정사·that절이면 it을 두고 뒤로 보낸다(I found it difficult to solve the problem). 가주어 it은 해석하지 않는다.",
+    # "의미상 주어" 단독 키워드는 넣지 않는다. 넣으면 "분사구문 의미상 주어"에서 이 항목이
+    # 더 길게 일치해 분사구문 항목보다 앞에 온다(search_concept_map은 긴 일치 우선).
+    ("영어", "to부정사 의미상 주어", "to부정사의 의미상 주어", "동명사 의미상 주어", "동명사의 의미상 주어"): "의미상 주어: to부정사·동명사가 나타내는 동작을 실제로 하는 주체. 문장의 주어와 같거나 일반인이면 쓰지 않는다. to부정사의 의미상 주어는 to부정사 앞에 for+목적격(It is easy for me to solve it = 내가 그것을 푸는 것은 쉽다. / This book is too difficult for children to read). 사람의 성격·태도를 나타내는 형용사(kind, nice, wise, foolish, careless, rude) 뒤에는 of+목적격(It is kind of you to help me = 나를 도와주다니 너는 친절하다). 동명사의 의미상 주어는 동명사 앞에 소유격 또는 목적격(Do you mind my(me) opening the window? = 내가 창문을 열어도 될까?).",
     ("영어", "동명사", "gerund"): "동명사(V+ing): 명사 역할. enjoy/avoid/finish/consider/mind+동명사. 전치사 뒤 항상 동명사. stop+동명사(멈춤) vs stop+to부정사(멈추고 ~하다).",
-    ("영어", "분사", "현재분사", "과거분사"): "현재분사(~ing): 능동·진행. 과거분사(~ed): 수동·완료. 감정동사: exciting(흥미롭게 하는)/excited(흥미로운 感). 분사구문: 부사절 축약, 주절 주어=분사 의미상 주어.",
+    ("영어", "분사", "현재분사", "과거분사"): "현재분사(~ing): 능동·진행(a sleeping baby 자고 있는 아기). 과거분사(p.p.): 수동·완료(a broken window 깨진 창문). 감정동사: 감정을 일으키면 ~ing(The movie was exciting), 감정을 느끼면 p.p.(I was excited). 분사 한 단어는 명사 앞에서, 뒤에 어구가 붙으면 명사 뒤에서 꾸민다(the girl sitting there).",
+    ("영어", "분사구문", "독립분사구문"): "분사구문: 부사절(때·이유·조건·양보·동시동작)에서 접속사와 주어를 빼고 동사를 분사로 바꾼 구문(When I walked home, I met him → Walking home, I met him). 의미상 주어: 분사구문의 주어가 주절의 주어와 같을 때만 생략한다. 다르면 분사 앞에 남긴다(독립분사구문: It being rainy, we stayed home). 잘못 생략하면 오류(Walking down the street, a tree fell ×). 수동이면 (being) p.p.(Seen from the sky, the island looks like a heart). 주절보다 앞선 일은 Having p.p. 부정은 Not+분사. 비인칭 독립분사구문: generally speaking, judging from. with+목적어+분사: 동시 상황(with his arms folded 팔짱을 낀 채).",
     ("영어", "가정법", "if"): "가정법 과거: If+과거동사, would+원형(현재 반대). 가정법 과거완료: If+had p.p., would have p.p.(과거 반대). I wish+가정법. as if+가정법. without/but for=if not for.",
-    ("영어", "수동태", "passive"): "수동태: be+p.p. 시제: is/was/has been/will be done. 4형식 수동: The book was given to me. 5형식 수동: He was made to work. by 생략 가능(행위자 불분명·중요치 않을 때).",
-    ("영어", "시제", "tense", "현재완료"): "현재완료(have+p.p.): 경험·완료·결과·계속. since+시점, for+기간. 대과거(had p.p.): 과거 이전. 현재진행 vs 현재: 일시적 vs 습관/사실.",
+    ("영어", "가정법 미래", "혼합가정법", "가정법 도치"): "가정법 미래: 일어날 가능성이 낮은 미래를 가정한다. If+주어+should+동사원형(혹시라도 ~한다면): 주절에 명령문·will·would 모두 가능(If you should see him, tell him to call me). If+주어+were to+동사원형(그럴 리 없겠지만 ~한다면): 주절은 would/could/might+동사원형(If the sun were to rise in the west, I would not change my mind). 혼합가정법: If+had p.p., 주어+would+동사원형(+now) — 과거 사실과 반대인 일이 현재에 미치는 결과(If I had studied harder, I would be a doctor now). 가정법 도치: if를 생략하면 Were/Had/Should가 주어 앞으로(Had I known = If I had known).",
+    ("영어", "수동태", "passive"): "수동태: be+p.p.(주어가 동작을 받음). 시제별: 현재 is done, 과거 was done, 미래 will be done, 진행 is being done, 현재완료 has/have been done(The bridge has been built), 과거완료 had been done. 조동사 수동: can be done. 4형식 수동: I was given the book / The book was given to me. 5형식 수동: 목적격보어가 원형부정사면 to부정사로(He was made to work). by+행위자는 불분명하거나 중요하지 않으면 생략. by 이외 전치사: be interested in, be covered with, be satisfied with, be known to.",
+    ("영어", "시제", "tense", "현재완료"): "현재완료(have/has+p.p.): 과거의 일이 현재와 이어질 때. 경험(I have been to Paris), 완료(I have just finished it), 결과(He has lost his key — 지금도 없음), 계속(I have lived here for 10 years / since 2015). 명확한 과거 시점 표현(yesterday, last year, ago, when)과 함께 쓰지 않는다. have been to(가 본 적 있다) vs have gone to(가 버리고 없다). 대과거(had p.p.): 과거보다 더 이전. 현재진행 vs 현재: 일시적 vs 습관·사실.",
     ("영어", "조동사", "modal"): "can(능력), may(추측·허락), must(의무/강한추측), should(조언), would(과거습관·공손). must not(금지) ≠ don't have to(불필요). should have p.p.: 과거에 ~했어야 했는데.",
     ("영어", "비교급", "최상급"): "비교급: more/~er+than. 최상급: most/~est+in/of. 원급: as+형용사+as. 배수: twice as~as. 비교급 강조: much/even/far/a lot. the+비교급, the+비교급(~할수록).",
     ("영어", "접속사", "conjunction"): "등위: and/but/or/so/for/yet. 종속: when/while/because/although/if/unless/since/after/before. 상관: both A and B, either A or B, neither A nor B, not only A but also B.",
@@ -63,8 +71,9 @@ CONCEPT_MAP: dict[tuple[str, ...], str] = {
     ("영어", "수일치", "주어동사"): "단수주어→단수동사, 복수주어→복수동사. each/every/either/neither→단수. both A and B→복수. either A or B→B에 일치. there is/are: 뒤 명사에 일치.",
     ("영어", "문장의 형식", "5형식", "4형식"): "1형식: S+V. 2형식: S+V+C(주격보어). 3형식: S+V+O. 4형식: S+V+IO+DO(간·직접목적어). 5형식: S+V+O+OC(목적격보어). 5형식 OC: 명사·형용사·to부정사·원형·분사.",
     ("영어", "간접의문문", "명사절"): "간접의문문: 의문사+주어+동사 어순. Do you know where he lives? (where he lives). whether/if+S+V: ~인지 아닌지. that절: I think that he is right (that 생략 가능).",
-    ("영어", "도치", "강조"): "부정어 도치: Never/Seldom/Hardly+조동사+주어+동사. 장소부사 도치: Here comes the bus. It~that 강조구문: It is money that he wants. 동사 강조: do/does/did+동사원형.",
-    ("영어", "관계부사", "복합관계사", "복합관계대명사", "복합관계부사"): "관계부사: where(장소), when(시간), why(이유), how(방법). 선행사+관계부사=전치사+관계대명사. 복합관계사: whoever(누구든), whatever(무엇이든), however(어떻게든).",
+    ("영어", "도치", "강조", "도치구문", "강조구문"): "도치: 강조하려는 말을 문장 앞으로 보내면 주어와 동사 순서가 바뀐다. 부정어(Never/Seldom/Hardly/Little/Not until)나 Only+부사구가 앞에 오면 조동사+주어+동사(Never have I seen such a thing). 일반동사는 do/does/did를 쓴다(Little did I dream that~). 장소·방향 부사구 도치: Here comes the bus. On the hill stands a church(대명사 주어는 도치하지 않음: Here he comes). so/neither+조동사+주어: So do I(나도 그래), Neither can I. 강조: It is/was ~ that 강조구문(It was money that he wanted), 동사 강조는 do/does/did+동사원형(I do love you).",
+    ("영어", "관계부사"): "관계부사: 선행사를 꾸미는 절을 이끌며, 뒤에는 빠진 성분이 없는 완전한 절이 온다(관계대명사 뒤는 불완전한 절). where(장소: the house where I was born), when(시간: the day when we met), why(이유: the reason why he left), how(방법). 관계부사=전치사+which: where=in/at which, when=on/in which, why=for which. how는 the way와 함께 쓰지 않는다(the way he did it 또는 how he did it). 선행사가 the place·the time·the reason처럼 일반적이면 선행사나 관계부사 중 하나를 생략할 수 있다. 계속적 용법(콤마)은 where(=and there), when(=and then)만 가능.",
+    ("영어", "복합관계사", "복합관계대명사", "복합관계부사", "whoever", "whatever"): "복합관계대명사(who/what/which+ever): 선행사를 포함한다. ①명사절: whoever=anyone who(~하는 사람은 누구든), whatever=anything that(~하는 것은 무엇이든), whichever=any one that(~하는 것은 어느 것이든). Whoever comes first will get a prize. ②양보 부사절: whoever=no matter who(누가 ~하더라도), whatever=no matter what, whichever=no matter which. Whatever you say, I won't change my mind. 복합관계부사: whenever(~할 때마다/언제 ~하더라도), wherever(~하는 곳은 어디든/어디서 ~하더라도), however(아무리 ~하더라도, 바로 뒤에 형용사·부사: However hard he tried, he failed).",
     ("영어", "병렬구조", "상관접속사"): "병렬구조: and/but/or로 연결된 어구는 같은 품사·형태. not A but B, not only A but also B, both A and B, either A or B, neither A nor B → A·B 문법 형태 동일.",
     ("영어", "독해 주제", "요지", "제목"): "주제/요지: 반복 어휘·핵심문장(특히 첫·끝 문장) 파악. 제목: 전체 내용 압축·포괄. 함의: 글의 흐름에서 추론. 오답 패턴: 너무 좁거나 넓은 선지, 지문 미언급 내용.",
     ("영어", "빈칸 추론"): "빈칸 추론: ①빈칸 앞뒤 문장 흐름 파악 ②빈칸이 주제와 연관 ③역접·인과 연결어 주목 ④선지 대입 후 문맥 확인. 자주 출제: 주제문 자리(첫·끝 문장), 예시 결론 자리.",
@@ -176,3 +185,27 @@ CONCEPT_MAP: dict[tuple[str, ...], str] = {
     ("한국사", "통일정책", "7.4남북공동성명", "남북기본합의서", "6.15", "이산가족", "남북관계"): "7·4 남북공동성명(1972): 자주·평화·민족대단결의 통일 3대 원칙에 최초 합의하고 남북조절위원회 설치, 그러나 남북 모두 유신 체제와 사회주의 헌법 등 독재 강화에 이용. 1980년대: 최초의 이산가족 고향 방문과 예술단 교환(1985). 남북기본합의서(1991): 남북을 '나라와 나라 사이가 아닌 통일을 지향하는 특수 관계'로 규정, 상호 불가침과 교류 협력 합의, 같은 해 남북한 유엔 동시 가입과 한반도 비핵화 공동선언. 6·15 남북공동선언(2000, 첫 정상회담): 금강산 관광, 개성공단, 경의선 복원, 이산가족 상봉 정례화. 10·4 선언(2007)과 판문점 선언(2018)으로 이어짐. 통일 방안은 남측의 민족공동체 통일방안(화해협력→남북연합→통일국가)과 북측의 고려연방제가 대비됨.",
     ("한국사", "독도", "간도", "영토"): "독도: 삼국사기에 지증왕 때 이사부의 우산국 복속 기록, 세종실록지리지·신증동국여지승람·동국문헌비고 등에 우리 영토로 기록, 숙종 때 안용복이 일본에 건너가 조선 영토임을 확인받음. 대한제국 칙령 제41호(1900)로 울릉군수가 독도를 관할하도록 규정 → 일본은 러일전쟁 중 시마네현 고시(1905)로 불법 편입. 광복 후 연합국 최고사령관 각서(SCAPIN 677)와 실효 지배로 우리 영토임이 재확인됨. 간도: 백두산정계비(1712)의 '토문강' 해석을 둘러싼 분쟁 지역으로 대한제국이 이범윤을 관리사로 파견했으나, 일본이 외교권을 빼앗은 상태에서 청과 간도협약(1909)을 맺어 남만주 철도 부설권을 얻는 대가로 청의 영유를 인정 — 당사국이 배제된 조약이어서 무효라는 것이 우리 입장.",
 }
+
+
+def _kw_matches(kw: str, query: str) -> bool:
+    """한국어 단어 경계 고려 매칭 — '수열'이 '등비수열' 내에서 오매칭되지 않도록."""
+    return bool(re.search(r'(?<![가-힣A-Za-z0-9])' + re.escape(kw) + r'(?![가-힣A-Za-z0-9])', query))
+
+
+def search_concept_map(subject: str, query: str, k: int) -> list[str]:
+    """키워드가 질의에 들어 있는 항목을 반환한다. 더 길게 일치한 항목이 앞에 온다.
+
+    예전에는 딕셔너리 순서대로 돌려줬다. 그러면 "to부정사 의미상 주어"에 "to부정사"로
+    걸린 부정사 항목이 "to부정사 의미상 주어"로 걸린 전용 항목보다 앞에 오고, 근거로
+    받은 모델이 첫 자료(명사적 용법)를 설명했다. 긴 키워드일수록 구체적인 항목이다.
+    """
+    query_lower = query.lower()
+    hits = []
+    for idx, (keys, content) in enumerate(CONCEPT_MAP.items()):
+        if keys[0] != subject:
+            continue
+        matched = [kw for kw in keys[1:] if _kw_matches(kw, query) or _kw_matches(kw, query_lower)]
+        if matched:
+            hits.append((-max(len(kw) for kw in matched), idx, content))
+    hits.sort()
+    return [content for _, _, content in hits[:k]]
