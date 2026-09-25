@@ -1,5 +1,4 @@
 import os
-import re
 import sys
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -25,7 +24,6 @@ class UTF8JSONResponse(JSONResponse):
         return json.dumps(content, ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 import torch
-import httpx
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 
@@ -35,6 +33,11 @@ from src.api.adapters import (
     MATH_SYSTEM_PROMPT, SUBJECT_ADAPTERS,
 )
 from src.api.routers import counseling, predictor, writing, rag
+from src.api.routers.counseling import _ollama_analyze
+from src.api.generation import CONCEPT_GEN
+from src.api.postprocess import strip_markdown, trim_cut_tail
+from src.api.script_guard import ForeignScriptBlocker, foreign_token_mask, has_foreign, strip_foreign
+from transformers import LogitsProcessorList
 from src.api.routers.rag import subject_aware_search as _subject_aware_search
 from src.api.java_client import get_student_weakness_from_java
 from src.api.grounding import concept_user_message, context_block
@@ -129,6 +132,9 @@ app.state.tokenizer = tokenizer
 app.state.writing_model     = base_model if LOAD_WRITING_ADAPTER else None
 app.state.writing_tokenizer = tokenizer
 
+# 개념 설명에 중국어·일본어 등 다른 문자가 섞이지 않게 해당 토큰을 막는다(script_guard.py).
+_FOREIGN_BLOCKER = ForeignScriptBlocker(foreign_token_mask(tokenizer, base_model.config.vocab_size))
+
 
 _SUBJECT_DEFAULT_CONCEPT: dict[str, str] = {
     "수학":   "방정식과 함수 기본 개념",
@@ -149,72 +155,6 @@ _SUBJECT_STRATEGY: dict[str, list[str]] = {
 }
 
 
-async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
-    import logging
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "llama3.1:latest",
-                    "prompt": prompt,
-                    "stream": False,
-                    # num_ctx: 참고 자료가 붙으면 한국어가 2천 토큰 가까이 된다.
-                    "options": {"num_predict": 150, "temperature": 0.4, "num_ctx": 4096},
-                },
-                timeout=timeout,
-            )
-            if r.status_code == 200:
-                return r.json().get("response", "").strip()
-            logging.warning(f"[Ollama] status {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        logging.warning(f"[Ollama] 연결 실패: {e}")
-    return None
-
-
-# 베이스 모델은 마크다운 헤더·이모지·수평선을 섞어 쓴다("## 📌 1. **정의**").
-# 어댑터는 그런 걸 쓰지 않아서 지금까지 문제가 없었는데, 수학을 베이스로 돌리면서
-# 학생에게 보이는 리포트에 그대로 흘러 들어가게 됐다. writing.py의 _llm_feedback()도
-# 같은 이유로 LLM 출력에서 마크다운을 걷어낸다.
-_MD_HEADER = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)   # 헤더 기호만 제거, 제목 텍스트는 남긴다
-_MD_RULE   = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", re.MULTILINE)
-# 별표는 겹별표(**굵게**, 짝이 안 맞고 남은 ** 포함)만 지운다. 겹별표가 곱셈을
-# 뜻하는 경우는 없어서 안전하다.
-#
-# 홑별표 이탤릭(*was read*)은 일부러 그냥 둔다. 영어 예문에 제법 나오지만,
-# 지우려 들면 곱셈 기호를 먹는다:
-#     "넓이는 a*b 이고 둘레는 2*(a+b)"  ->  "넓이는 ab 이고 둘레는 2(a+b)"
-# 한 줄에 별표가 둘이면 무엇을 해도 이탤릭 쌍과 구분되지 않는다. 남은 별표는
-# 보기 사나운 정도지만 수식이 틀리는 것은 내용 오류다. 덜 나쁜 쪽을 택한다.
-_MD_BOLD_PAIR     = re.compile(r"\*{2,3}(.+?)\*{2,3}", re.DOTALL)
-_MD_BOLD_LEFTOVER = re.compile(r"\*{2,}")
-# $...$ 안의 수식은 손대지 않는다. 치환 전에 빼뒀다가 마지막에 되돌린다.
-_LATEX_SPAN = re.compile(r"\$[^$\n]*\$")
-_EMOJI     = re.compile(
-    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF️←-⇿⬀-⯿]"
-)
-
-
-def _strip_markdown(text: str) -> str:
-    """개념 설명 출력에서 마크다운·이모지를 걷어내고 평문 문단으로 정리한다."""
-    latex: list[str] = []
-
-    def _hide(m: "re.Match[str]") -> str:
-        latex.append(m.group(0))
-        return f"\x00{len(latex) - 1}\x00"
-
-    text = _LATEX_SPAN.sub(_hide, text)
-    text = _MD_RULE.sub("", text)
-    text = _MD_HEADER.sub("", text)
-    text = _MD_BOLD_PAIR.sub(r"\1", text)
-    text = _MD_BOLD_LEFTOVER.sub("", text)
-    text = _EMOJI.sub("", text)
-    # 빈 줄이 여러 개 생기므로 문단 구분은 한 줄로 통일하고 줄 끝 공백을 없앤다
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r" *\n *", "\n", text)
-    text = re.sub(r"\n{2,}", "\n", text)
-    text = re.sub(r"\x00(\d+)\x00", lambda m: latex[int(m.group(1))], text)
-    return text.strip()
 
 
 # 개념 설명에서 어댑터를 끄고 베이스로 생성할 과목.
@@ -301,10 +241,8 @@ def _concept_explain(subject: str, concept_query: str,
             with torch.no_grad():
                 return model.generate(
                     **inputs,
-                    max_new_tokens=200,
-                    temperature=0.3,
-                    do_sample=True,
-                    repetition_penalty=1.2,
+                    **CONCEPT_GEN,  # 한도·온도는 generation.py (200토큰에서 전부 잘렸다)
+                    logits_processor=LogitsProcessorList([_FOREIGN_BLOCKER]),
                     pad_token_id=tokenizer.eos_token_id,
                 )
 
@@ -316,7 +254,13 @@ def _concept_explain(subject: str, concept_query: str,
             outputs = _gen()
 
         text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
-        return _strip_markdown(text) or None
+        text = strip_markdown(text)
+        if outputs.shape[-1] - input_len >= CONCEPT_GEN["max_new_tokens"]:
+            text = trim_cut_tail(text)
+        # 바이트 단위로 쪼개진 드문 한자는 토큰 마스크로 못 막는다. 남으면 지운다.
+        if has_foreign(text):
+            text = strip_foreign(text).strip()
+        return text or None
     except Exception as e:
         logging.warning(f"[{subject} 개념 설명] 생성 실패: {e}")
         return None
