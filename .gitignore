@@ -38,6 +38,8 @@ start-ai.ps1
 *.json
 *.jsonl
 *.csv
+# 사실 정확도 평가의 기준 출력과 판정 기록(test_grounded_explain_eval.py compare가 읽음)
+!eval/*.json
 
 # Distribution / packaging
 .Python
