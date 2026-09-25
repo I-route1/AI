@@ -99,12 +99,19 @@ def _resolve_concept(subject: str, req: dict) -> str:
     Backend의 recommendContext는 개념이 아니라 수준 라벨이다("심화 과정 추천",
     "기초 강화 필요" 등 — GpsDummyDataInitializer). 예전에는 이걸 개념으로 받아
     "수학 '기초 강화 필요' 개념을 어려워합니다"라는 프롬프트를 만들고 그 말로 자료를
-    검색했다. ConceptMap에 있는 개념어일 때만 그대로 쓰고, 아니면 subject-recommend처럼
-    Backend에서 그 과목의 오답 개념 태그를 가져온다(Java 호출이라 블로킹).
+    검색했다. 그래서 Backend가 그 과목의 최다 오답 개념을 weakConcept로 함께 넘긴다.
+    weakConcept가 비어 있으면 recommendContext가 ConceptMap 개념어일 때만 그대로 쓴다.
+    weakConcept가 없는(None) 요청 — 프리미엄 리포트, weakConcept 이전 Backend — 은
+    Backend 오답 API에서 개념 태그를 직접 가져온다(Java 호출이라 블로킹).
     """
+    weak = req.get("weakConcept")
+    if weak and weak.strip():
+        return weak.strip()
     ctx = (req.get("recommendContext") or "").strip()
     if ctx and search_concept_map(subject, ctx, 1):
         return ctx
+    if weak is not None:  # Backend가 이미 찾아 봤고 오답이 없었다
+        return ""
     sid = req.get("studentId")
     if sid:
         for w in get_student_weakness_from_java(str(sid), subject) or []:
