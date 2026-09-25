@@ -1341,9 +1341,11 @@ Backend가 넘기는 `recommendContext`는 **수준 라벨**입니다("심화 �
 프롬프트를 만들고, 그 말로 자료를 검색하고, 학습 전략에 "'기초 강화 필요' 단원 기출
 10문항"이라고 썼습니다.
 
-이제 리포트 4종 모두 개념을 이렇게 정합니다: ConceptMap에 있는 개념어면 그대로 → 아니면
-`subject-recommend`처럼 Backend 오답 API에서 그 과목의 conceptTag → 없으면 개념 문단을 만들지
-않습니다. 라벨은 "● 학습 방향: …"으로 따로 보여 줍니다. 개념을 못 정했을 때의 "관련 학습 자료"는
+이제 리포트 4종 모두 개념을 이렇게 정합니다: Backend가 넘긴 `weakConcept`(그 과목 최다 오답의
+conceptTag, `AiCounselingService.fetchRealStudentData`) → 비었으면 `recommendContext`가 ConceptMap
+개념어일 때만 그대로 → 개념 문단을 만들지 않습니다. `weakConcept`가 아예 없는 요청(프리미엄
+리포트는 AI가 주 과목을 고르므로 Backend가 넘기지 않음, 또는 이 필드 이전 Backend)만
+`subject-recommend`처럼 Backend 오답 API를 한 번 더 부릅니다. 라벨은 "● 학습 방향: …"으로 따로 보여 줍니다. 개념을 못 정했을 때의 "관련 학습 자료"는
 ConceptMap 자료만 보여 줍니다(기본 검색어로 찾은 FAISS 조각은 "Use the phrases from the
 vocabulary list." 같은 문장이었습니다).
 
@@ -1731,8 +1733,6 @@ JSON은 UTF-8 BOM으로 시작해 `utf-8-sig`로 읽어야 합니다.
   출력을 읽어 판정해야 한다(`test_grounded_explain_eval.py`).
 - **개념 설명 생성 시간이 길다** — 잘림을 없애려 한도를 800으로 올려 한 번에 12~40초.
   줄이려면 프롬프트로 분량을 제한하는 방법이 있다(바꾸면 79개 평가를 다시 돌릴 것).
-- **Backend `recommendContext`가 수준 라벨이다** — AI 쪽에서 오답 API로 개념을 찾아 우회했다.
-  Backend가 실제 취약 개념을 따로 넘겨 주면 조회 한 번을 줄일 수 있다.
 - `rpi/pose_hailo.py`의 `decode_keypoints()` 미구현 — **Hailo 실물 없이는
   진행 불가**. 추측으로 구현하면 예외 대신 '그럴듯하지만 틀린 좌표'가 나오고,
   그 값이 `classify_posture()`를 거쳐 백엔드 학습활동 기록까지 올라간다.
