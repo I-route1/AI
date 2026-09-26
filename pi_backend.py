@@ -137,8 +137,14 @@ class BackendClient:
         """학습 활동 1건 기록. POST /api/activities (JSON 바디).
 
         study_date: "YYYY-MM-DD", study_start_time: "HH:MM:SS"
-        understanding_score / concentration_score: 백엔드가 int로 받는다.
+        understanding_score / concentration_score: 1~5점 별점(LearningActivity와 앱이 같은
+        척도를 쓴다). 범위를 벗어나면 보내지 않는다 — 0~100을 보내면 Backend 메타인지
+        분석(이해도 × 20)이 수백 점이 된다.
         """
+        for name, score in (("understanding_score", understanding_score),
+                            ("concentration_score", concentration_score)):
+            if not 1 <= score <= 5:
+                raise BackendError(f"{name}는 1~5여야 합니다: {score}")
         payload = {
             "studentId": student_id,
             "subject": subject,

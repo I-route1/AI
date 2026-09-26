@@ -9,12 +9,15 @@ Pi5에서:
 자동으로 비활성화되고 집중도 분류만 동작한다.
 
 종료(Ctrl+C) 시 세션을 집계해 백엔드 POST /api/activities 로 올리려면:
-    python rpi/pi_main.py --upload --student-id 14 --subject 수학
+    python rpi/pi_main.py --upload --student-id 14 --subject 수학 --understanding 4
 이때 .env에 BACKEND_URL과 토큰(또는 계정)이 있어야 한다. pi_backend.py 참고.
 
-집중도(concentrationScore)는 '집중' 판정 비율로 계산한다. 이해도
-(understandingScore)는 카메라로 측정할 수 없으므로 추정하지 않고,
---understanding 으로 직접 입력받는다(미지정 시 0).
+두 점수 모두 Backend LearningActivity의 1~5점 별점 척도로 보낸다. Backend는 앱에서
+학생이 매긴 별점과 같은 필드로 받고, 메타인지 분석은 이해도에 20을 곱해 100점으로
+환산한다. 예전에는 집중도를 0~100으로, 이해도를 기본값 0으로 보내 평균이 왜곡됐다.
+- 집중도(concentrationScore): '집중' 판정 비율 0~100%를 1~5점으로 환산(_to_stars)
+- 이해도(understandingScore): 카메라로 측정할 수 없어 추정하지 않는다. --upload 때는
+  --understanding 1~5를 반드시 받는다(0을 보내면 이해도 평균을 끌어내린다).
 """
 import argparse
 import sys
@@ -51,12 +54,20 @@ def _parse_args():
     ap.add_argument("--student-id", type=int, default=None,
                     help="업로드 대상 학생 ID (기본: .env의 STUDENT_ID)")
     ap.add_argument("--subject", default=None, help="업로드 시 과목명 (예: 수학)")
-    ap.add_argument("--understanding", type=int, default=0,
-                    help="이해도 점수(0~100). 카메라로 측정할 수 없어 직접 입력받는다.")
+    ap.add_argument("--understanding", type=int, choices=range(1, 6), default=None,
+                    metavar="{1..5}",
+                    help="이해도 별점(1~5). 카메라로 측정할 수 없어 직접 입력받는다. --upload 시 필수.")
     args = ap.parse_args()
     if args.upload and not args.subject:
         ap.error("--upload 를 쓰려면 --subject 도 지정해야 합니다.")
+    if args.upload and args.understanding is None:
+        ap.error("--upload 를 쓰려면 --understanding(1~5)도 지정해야 합니다.")
     return args
+
+
+def _to_stars(focused_ratio: float) -> int:
+    """'집중' 비율(0~1)을 Backend 별점 1~5로. 0%→1, 50%→3, 100%→5."""
+    return 1 + int(max(0.0, min(1.0, focused_ratio)) * 4 + 0.5)  # round()는 2.5→2라 쓰지 않는다
 
 
 def _upload_session(args, counts: Counter, started_at: float) -> None:
@@ -75,7 +86,8 @@ def _upload_session(args, counts: Counter, started_at: float) -> None:
         print("[업로드] 얼굴이 한 번도 검출되지 않아 전송할 집계가 없습니다.")
         return
 
-    concentration = round(counts[FOCUSED_LABEL] / graded * 100)
+    focused_ratio = counts[FOCUSED_LABEL] / graded
+    concentration = _to_stars(focused_ratio)
     duration_min = max(1, round((time.time() - started_at) / 60))
 
     try:
@@ -88,7 +100,8 @@ def _upload_session(args, counts: Counter, started_at: float) -> None:
             understanding_score=args.understanding,
             concentration_score=concentration,
         )
-        print(f"[업로드] 기록 완료 — {duration_min}분, 집중도 {concentration}점")
+        print(f"[업로드] 기록 완료 — {duration_min}분, 집중 {focused_ratio * 100:.0f}% → 집중도 {concentration}/5, "
+              f"이해도 {args.understanding}/5")
     except BackendError as e:
         print(f"[업로드] 실패: {e}")
 
