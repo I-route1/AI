@@ -19,14 +19,15 @@ import io
 import json
 import random
 import time
-from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image, ImageFilter
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
+from ocr.augment import (SCALE, P, _blur, _chain, _clip, _dim, _jpeg, _lowres, _noise, _pad,
+                         _perspective, _rotate, _shadow)
 from ocr.dataset import OCRCropDataset, load_charset
 from ocr.decode import greedy_decode, levenshtein, similarity
 from ocr.inference import DEFAULT_CKPT, TARGET_HEIGHT, trim_to_ink
@@ -34,99 +35,6 @@ from ocr.model import CRNN
 
 CROPS_DIR = Path(__file__).parent / "crops"
 THRESHOLD = 0.8  # grading.py / pi_ocr_grade.py 기본값
-SCALE = 3        # 변형을 적용할 배율
-
-
-# 변형은 (im, rng, **설정) 모양의 모듈 최상위 함수 + functools.partial로 만든다. 윈도우의
-# DataLoader 워커는 spawn이라 lambda·클로저를 넘기지 못한다(pickle 불가).
-
-def _rotate(im, rng, deg):
-    return im.rotate(rng.uniform(-deg, deg), resample=Image.BILINEAR, expand=True, fillcolor=255)
-
-
-def _blur(im, rng, sigma):
-    return im.filter(ImageFilter.GaussianBlur(sigma * SCALE))
-
-
-def _lowres(im, rng, height):
-    # 카메라가 멀어 글자 높이가 height px밖에 안 되는 경우
-    w = max(1, round(im.width * height / im.height))
-    return im.resize((w, height), Image.BILINEAR).resize(im.size, Image.BILINEAR)
-
-
-def _perspective(im, rng, strength):
-    # 위아래 폭이 다른 사다리꼴 — 카메라가 비스듬히 내려다볼 때
-    w, h = im.size
-    d = strength * w * rng.uniform(0.5, 1.0) * rng.choice([-1, 1])
-    src = [(0, 0), (w, 0), (w, h), (0, h)]
-    dst = [(max(0, d), 0), (w - max(0, d), 0), (w - max(0, -d), h), (max(0, -d), h)]
-    return im.transform((w, h), Image.PERSPECTIVE, _perspective_coeffs(dst, src),
-                        Image.BILINEAR, fillcolor=255)
-
-
-def _perspective_coeffs(pa, pb):
-    m = []
-    for (x, y), (u, v) in zip(pa, pb):
-        m.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
-        m.append([0, 0, 0, x, y, 1, -v * x, -v * y])
-    a = np.array(m, dtype=np.float64)
-    b = np.array(pb, dtype=np.float64).reshape(8)
-    return np.linalg.solve(a, b).tolist()
-
-
-def _dim(im, rng, contrast, brightness):
-    # 어두운 조명: 대비를 줄이고 전체를 어둡게
-    a = np.asarray(im, dtype=np.float32) / 255.0
-    a = ((a - 0.5) * contrast + 0.5) * brightness
-    return Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8))
-
-
-def _shadow(im, rng, depth):
-    # 한쪽이 어두운 그림자(손·스탠드) — 가로 방향 선형 그라데이션
-    a = np.asarray(im, dtype=np.float32) / 255.0
-    g = np.linspace(1.0, 1.0 - depth, a.shape[1], dtype=np.float32)
-    if rng.random() < 0.5:
-        g = g[::-1]
-    return Image.fromarray((np.clip(a * g[None, :], 0, 1) * 255).astype(np.uint8))
-
-
-def _noise(im, rng, std):
-    a = np.asarray(im, dtype=np.float32) / 255.0
-    n = np.random.default_rng(rng.randrange(1 << 30)).normal(0, std, a.shape).astype(np.float32)
-    return Image.fromarray((np.clip(a + n, 0, 1) * 255).astype(np.uint8))
-
-
-def _jpeg(im, rng, q):
-    buf = io.BytesIO()
-    im.save(buf, format="JPEG", quality=q)
-    return Image.open(io.BytesIO(buf.getvalue())).convert("L")
-
-
-def _pad(im, rng, ratio):
-    # 템플릿 답 칸이 글씨보다 넓은 경우 — 좌우·위아래 흰 여백
-    w, h = im.size
-    px, py = round(w * ratio), round(h * ratio)
-    out = Image.new("L", (w + 2 * px, h + 2 * py), 255)
-    out.paste(im, (px, py))
-    return out
-
-
-def _clip(im, rng, ratio):
-    # 답 칸이 어긋나 글씨 양 끝이 잘린 경우
-    w, h = im.size
-    cut = round(w * ratio)
-    return im.crop((cut, 0, max(cut + 1, w - cut), h))
-
-
-def _chain(im, rng, fs):
-    for g in fs:
-        im = g(im, rng)
-    return im
-
-
-P = partial
-
-
 CONDITIONS = {
     "원본": None,
     "흐림 약(σ1)": P(_blur, sigma=1.0),

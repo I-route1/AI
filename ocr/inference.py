@@ -9,7 +9,11 @@ from ocr.decode import greedy_decode
 from ocr.model import CRNN
 
 TARGET_HEIGHT = 32
-DEFAULT_CKPT = Path(__file__).parent / "ocr_model.pt"
+# 카메라 변형(흐림·저해상도 중심)을 섞어 3 epoch 추가 학습한 모델. 검증 전체 성능은 같고
+# (CER 0.1266 → 0.1266) 흐림 강 0.26 → 0.64, 글자 높이 10px 0.33 → 0.57 등 촬영 변형에 강하다
+# (eval/ocr_eval_trim.json → eval/ocr_eval_aug_trim.json). 파일이 없으면 기존 모델을 쓴다.
+_AUG_CKPT = Path(__file__).parent / "ocr_model_aug.pt"
+DEFAULT_CKPT = _AUG_CKPT if _AUG_CKPT.exists() else Path(__file__).parent / "ocr_model.pt"
 
 
 def trim_to_ink(img: Image.Image, margin_ratio: float = 0.08) -> Image.Image:

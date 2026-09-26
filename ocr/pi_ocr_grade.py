@@ -4,7 +4,7 @@
 사전 준비 (Pi5에서):
     pip install torch --index-url https://download.pytorch.org/whl/cpu  # ARM CPU 빌드
     pip install pillow
-    # ocr/ocr_model.pt, ocr/model.py, ocr/decode.py, ocr/inference.py, ocr/grading.py 를 Pi5로 복사
+    # ocr/ocr_model_aug.pt(없으면 ocr/ocr_model.pt), ocr/model.py, ocr/decode.py, ocr/inference.py, ocr/grading.py 를 Pi5로 복사
 
 문항 정의 JSON 형식 (questions.json):
 [
@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--image", required=True, help="채점할 워크시트 이미지 경로")
     ap.add_argument("--questions", required=True, help="문항 정의 JSON 경로")
     ap.add_argument("--threshold", type=float, default=0.8, help="정답 판정 유사도 임계값")
-    ap.add_argument("--ckpt", default=None, help="OCR 모델 체크포인트 경로 (기본: ocr/ocr_model.pt)")
+    ap.add_argument("--ckpt", default=None, help="OCR 모델 체크포인트 경로 (기본: ocr/ocr_model_aug.pt, 없으면 ocr/ocr_model.pt)")
     # 답 칸(bbox)은 보통 글씨보다 넓다. 여백을 남기면 여백 30%에서 정답 인정률이 0.87 → 0.47로
     # 떨어지고, 잘라 내면 0.78로 회복된다(ocr/eval_ocr.py, eval/ocr_eval_trim.json).
     ap.add_argument("--no-trim", action="store_true",
