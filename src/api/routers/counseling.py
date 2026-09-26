@@ -4,7 +4,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from src.api import model_registry
 from src.api.concept_map import search_concept_map
-from src.api.generation import OLLAMA_MODEL, OLLAMA_OPTIONS, OLLAMA_URL
+from src.api.generation import OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_OPTIONS, OLLAMA_URL
 from src.api.java_client import get_student_weakness_from_java
 from src.api.grounding import context_block, is_curated
 from src.api.postprocess import strip_markdown
@@ -48,7 +48,8 @@ async def _ollama_once(client: httpx.AsyncClient, prompt: str, timeout: float) -
     import logging
     r = await client.post(
         OLLAMA_URL,
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": OLLAMA_OPTIONS},
+        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": OLLAMA_OPTIONS,
+              "keep_alive": OLLAMA_KEEP_ALIVE},
         timeout=timeout,
     )
     if r.status_code == 200:
@@ -84,6 +85,23 @@ def _level_label(percentile: float) -> str:
     if percentile >= 50: return "중위권"
     if percentile >= 30: return "중하위권"
     return "기초 학습 필요"
+
+
+def _level_basis(subject: str, req: dict) -> tuple[float, str]:
+    """(수준 판정에 쓸 백분위, 리포트에 적을 근거 문구).
+
+    그 과목 최근 시험 백분위(Backend subjectPercentile) → 국어 백분위(currentKoreanGrade) 순으로 쓰고
+    어느 것을 썼는지 문구에 밝힌다. 예전에는 영어·과학 리포트도 국어 백분위를 "백분위"라고만
+    적었다. 둘 다 없으면(Backend는 없을 때 0을 보낸다) 판정은 중위권(50) 기준으로 하되
+    "성적 정보 없음"이라고 쓴다 — 예전에는 기본값 50을 "백분위 50%"로 적어 실제 성적처럼 보였다.
+    """
+    sp = req.get("subjectPercentile")
+    if isinstance(sp, (int, float)) and sp > 0:
+        return float(sp), f"{subject} 백분위 {sp:.0f}%"
+    kg = float(req.get("currentKoreanGrade") or 0)
+    if kg > 0:
+        return kg, f"국어 백분위 {kg:.0f}%"
+    return 50.0, "성적 정보 없음"
 
 
 def _study_intensity(hours: float) -> str:
@@ -151,7 +169,7 @@ def _math_report(req: dict, concept: str) -> tuple[dict, list[str]]:
     """(리포트, 검색한 RAG 자료). 자료는 LLM 문단의 근거로 다시 쓴다.
     concept은 _resolve_concept()로 정한 취약 개념(없으면 빈 문자열)."""
     student_id     = req.get("studentId", "")
-    percentile     = float(req.get("currentKoreanGrade") or 50)
+    percentile, basis = _level_basis("수학", req)
     study_hours    = float(req.get("studyTime") or 1)
     student_note   = req.get("studentNote") or ""
     feedback       = req.get("instructorFeedback") or ""
@@ -165,7 +183,7 @@ def _math_report(req: dict, concept: str) -> tuple[dict, list[str]]:
 
     career_analysis = (
         f"[수학 사고력 및 오답 패턴 분석]\n\n"
-        f"● 현재 학업 수준: {level} (국어 백분위 {percentile:.0f}%)\n"
+        f"● 현재 학업 수준: {level} ({basis})\n"
         f"● 학습 강도: {stamina} (일 {study_hours:.1f}시간)\n"
     )
     career_analysis += _direction_line(req, concept)
@@ -203,7 +221,7 @@ def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[s
     (리포트, 검색한 RAG 자료)를 돌려준다. 자료는 LLM 문단의 근거로 다시 쓴다.
     concept은 _resolve_concept()로 정한 취약 개념(없으면 빈 문자열)."""
     student_id     = req.get("studentId", "")
-    percentile     = float(req.get("currentKoreanGrade") or 50)
+    percentile, basis = _level_basis(subject, req)
     study_hours    = float(req.get("studyTime") or 1)
     student_note   = req.get("studentNote") or ""
     feedback       = req.get("instructorFeedback") or ""
@@ -217,7 +235,7 @@ def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[s
 
     career_analysis = (
         f"[{subject} 사고력 및 오답 패턴 분석]\n\n"
-        f"● 현재 학업 수준: {level} (백분위 {percentile:.0f}%)\n"
+        f"● 현재 학업 수준: {level} ({basis})\n"
         f"● 학습 강도: {stamina} (일 {study_hours:.1f}시간)\n"
     )
     career_analysis += _direction_line(req, concept)
@@ -253,7 +271,7 @@ def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[s
 
 def _writing_report(req: dict, concept: str) -> dict:
     student_id    = req.get("studentId", "")
-    percentile    = float(req.get("currentKoreanGrade") or 50)
+    percentile, basis = _level_basis("국어", req)
     study_hours   = float(req.get("studyTime") or 1)
     student_note  = req.get("studentNote") or ""
     recommend_ctx = req.get("recommendContext") or ""
@@ -268,7 +286,7 @@ def _writing_report(req: dict, concept: str) -> dict:
 
     career_analysis = (
         f"[언어·작문 역량 및 진로 적합성 분석]\n\n"
-        f"● 국어 학업 수준: {level} (백분위 {percentile:.0f}%)\n"
+        f"● 국어 학업 수준: {level} ({basis})\n"
         f"● 일일 학습 시간: {study_hours:.1f}시간\n"
     )
     if student_note:
@@ -311,13 +329,18 @@ def _writing_report(req: dict, concept: str) -> dict:
 
 
 def _premium_subject(req: dict) -> str:
+    """프리미엄 리포트의 주 취약 과목. Backend가 오답이 가장 많은 과목(weakSubject)을 넘긴다.
+    없으면(오답 없음, 이전 Backend) 예전 규칙 — recommendContext는 수준 라벨이라 사실상 수학."""
+    weak = (req.get("weakSubject") or "").strip()
+    if weak in _SUBJECT_KEYWORDS:
+        return weak
     ctx = req.get("recommendContext") or ""
     return "영어" if "영어" in ctx else "국어" if "국어" in ctx else "수학"
 
 
 def _premium_report(req: dict, concept: str) -> dict:
     student_id    = req.get("studentId", "")
-    percentile    = float(req.get("currentKoreanGrade") or 50)
+    percentile, basis = _level_basis(_premium_subject(req), req)
     study_hours   = float(req.get("studyTime") or 1)
     student_note  = req.get("studentNote") or ""
     recommend_ctx = req.get("recommendContext") or ""
@@ -333,7 +356,7 @@ def _premium_report(req: dict, concept: str) -> dict:
     career_analysis = (
         f"[i-Route 프리미엄 종합 학습 진단]\n\n"
         f"━━ 학업 현황 ━━\n"
-        f"● 학업 수준: {level} (국어 백분위 {percentile:.0f}%)\n"
+        f"● 학업 수준: {level} ({basis})\n"
         f"● 학습 강도: {stamina} (일 {study_hours:.1f}시간)\n"
     )
     if student_note:
@@ -380,8 +403,9 @@ def _premium_report(req: dict, concept: str) -> dict:
         f"  금: 3과목 약점 점검 미니 테스트\n"
         f"  주말: 전 주 복습 + 다음 주 예습 30분씩\n\n"
         f"━━ 목표 설정 ━━\n"
-        f"  현재 {percentile:.0f}% → "
-        f"{'99% 목표: 실수 0건' if percentile >= 85 else f'{min(100, percentile+15):.0f}% 목표: 취약 단원 집중 공략'}"
+        + (f"  현재 {percentile:.0f}% → "
+           f"{'99% 목표: 실수 0건' if percentile >= 85 else f'{min(100, percentile+15):.0f}% 목표: 취약 단원 집중 공략'}"
+           if basis != "성적 정보 없음" else "  성적을 등록하면 목표 백분위를 계산합니다")
     )
 
     return {
@@ -414,10 +438,10 @@ async def report_writing(req: dict):
     concept = await run_in_threadpool(_resolve_concept, "국어", req)
     result = _writing_report(req, concept)
     note = req.get("studentNote", "").strip()
-    percentile = float(req.get("currentKoreanGrade") or 50)
+    _, basis = _level_basis("국어", req)
     hours = float(req.get("studyTime") or 1)
     prompt = (
-        f"국어 백분위 {percentile:.0f}%, 하루 공부 시간 {hours:.0f}시간인 학생입니다. "
+        f"{basis}, 하루 공부 시간 {hours:.0f}시간인 학생입니다. "
         f"학생 특성: '{note or '특이사항 없음'}'.{_feedback_clause(req)} "
         f"이 학생의 국어(문학·비문학·작문) 실력을 올릴 구체적인 공부 방법 2가지를{_ADVICE_RULES}"
     )
@@ -432,12 +456,12 @@ async def report_premium(req: dict):
     concept = await run_in_threadpool(_resolve_concept, _premium_subject(req), req)
     result = _premium_report(req, concept)
     label = (req.get("recommendContext") or "").strip()
-    percentile = float(req.get("currentKoreanGrade") or 50)
+    _, basis = _level_basis(_premium_subject(req), req)
     note = req.get("studentNote", "").strip()
     hours = float(req.get("studyTime") or 1)
     direction = f"학습 방향: '{label}', " if label and label != concept else ""
     prompt = (
-        f"학생 정보 — 국어 백분위 {percentile:.0f}%, 하루 공부 {hours:.0f}시간, {direction}"
+        f"학생 정보 — {basis}, 하루 공부 {hours:.0f}시간, {direction}"
         f"취약 개념: '{concept or '특정되지 않음'}', 특성: '{note or '없음'}'.{_feedback_clause(req)} "
         f"이 학생이 성적을 올리려면 이번 주에 가장 먼저 해야 할 행동 2가지를{_ADVICE_RULES}"
     )
