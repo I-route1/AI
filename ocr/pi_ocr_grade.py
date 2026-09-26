@@ -43,6 +43,10 @@ def main():
     ap.add_argument("--questions", required=True, help="문항 정의 JSON 경로")
     ap.add_argument("--threshold", type=float, default=0.8, help="정답 판정 유사도 임계값")
     ap.add_argument("--ckpt", default=None, help="OCR 모델 체크포인트 경로 (기본: ocr/ocr_model.pt)")
+    # 답 칸(bbox)은 보통 글씨보다 넓다. 여백을 남기면 여백 30%에서 정답 인정률이 0.87 → 0.47로
+    # 떨어지고, 잘라 내면 0.78로 회복된다(ocr/eval_ocr.py, eval/ocr_eval_trim.json).
+    ap.add_argument("--no-trim", action="store_true",
+                    help="답 칸의 빈 여백을 잘라 내지 않음 (bbox를 글씨에 딱 맞게 잡은 경우)")
     ap.add_argument("--upload", action="store_true", help="채점 후 오답을 백엔드에 기록")
     ap.add_argument("--student-id", type=int, default=None,
                     help="업로드 대상 학생 ID (기본: .env의 STUDENT_ID)")
@@ -56,7 +60,7 @@ def main():
         regions = json.load(f)
 
     kwargs = {"ckpt_path": args.ckpt} if args.ckpt else {}
-    recognizer = OCRRecognizer(**kwargs)
+    recognizer = OCRRecognizer(trim=not args.no_trim, **kwargs)
     report = grade_worksheet(args.image, regions, recognizer, threshold=args.threshold)
 
     print(f"채점 결과: {report.score}/{report.total}")

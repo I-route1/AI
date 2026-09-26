@@ -12,8 +12,34 @@ TARGET_HEIGHT = 32
 DEFAULT_CKPT = Path(__file__).parent / "ocr_model.pt"
 
 
+def trim_to_ink(img: Image.Image, margin_ratio: float = 0.08) -> Image.Image:
+    """글씨가 있는 영역만 남기고 빈 여백을 잘라 낸다.
+
+    학습 crop은 라벨 bbox라 글씨에 딱 맞는데, 워크시트 답 칸(bbox)은 보통 글씨보다 넓다.
+    여백이 있으면 높이 32로 줄일 때 글씨가 작아져, 여백 30%에서 채점 정답 인정률이
+    0.87 → 0.47로 떨어졌다(ocr/eval_ocr.py). 배경 밝기(상위 90%)와 가장 어두운 획(하위 2%)의
+    중간보다 어두운 픽셀을 글씨로 보고, 그 범위에 여유(글씨 높이의 margin_ratio)를 둔다.
+    대비가 거의 없으면(빈 칸) 그대로 돌려준다.
+    """
+    gray = img.convert("L")
+    a = np.asarray(gray, dtype=np.float32)
+    bg, dark = np.percentile(a, 90), np.percentile(a, 2)
+    if bg - dark < 30:
+        return gray
+    ink = a < bg - 0.5 * (bg - dark)
+    rows = np.where(ink.sum(axis=1) >= 2)[0]
+    cols = np.where(ink.sum(axis=0) >= 2)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return gray
+    m = max(1, round((rows[-1] - rows[0] + 1) * margin_ratio))
+    box = (max(0, cols[0] - m), max(0, rows[0] - m),
+           min(gray.width, cols[-1] + 1 + m), min(gray.height, rows[-1] + 1 + m))
+    return gray.crop(box)
+
+
 class OCRRecognizer:
-    def __init__(self, ckpt_path: Path = DEFAULT_CKPT, device: str | None = None):
+    def __init__(self, ckpt_path: Path = DEFAULT_CKPT, device: str | None = None, trim: bool = False):
+        self.trim = trim
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         self.chars = ckpt["chars"]
@@ -24,7 +50,7 @@ class OCRRecognizer:
         self.model.eval()
 
     def _preprocess(self, img: Image.Image) -> torch.Tensor:
-        img = img.convert("L")
+        img = trim_to_ink(img) if self.trim else img.convert("L")
         new_w = max(1, round(img.width * TARGET_HEIGHT / img.height))
         img = img.resize((new_w, TARGET_HEIGHT), Image.BILINEAR)
         arr = np.asarray(img, dtype=np.float32) / 255.0
