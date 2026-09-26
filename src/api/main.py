@@ -11,6 +11,9 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 from dotenv import load_dotenv
 load_dotenv()
 
+import hmac
+import threading
+
 from fastapi import FastAPI, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +57,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 공유 키. 이 서버를 ngrok으로 외부에 열면 주소만 알아도 GPU 생성을 부를 수 있다.
+# .env에 AI_SERVER_KEY가 있으면 /api/ 요청에 같은 값의 X-AI-Key 헤더를 요구한다
+# (Backend는 같은 이름의 환경변수로 이 헤더를 붙인다 — AiClientConfig). 없으면 검사하지 않는다.
+_AI_SERVER_KEY = os.getenv("AI_SERVER_KEY", "").strip()
+
+
+@app.middleware("http")
+async def _require_ai_key(request, call_next):
+    if (_AI_SERVER_KEY and request.url.path.startswith("/api/") and request.method != "OPTIONS"
+            and not hmac.compare_digest(request.headers.get("X-AI-Key", ""), _AI_SERVER_KEY)):
+        return JSONResponse(status_code=401, content={"detail": "X-AI-Key가 없거나 틀렸습니다."})
+    return await call_next(request)
 
 # ⚠️ 라우터 등록은 파일 맨 아래에 있다. counseling 라우터의 /report/{subject}가
 # catch-all이라, 먼저 등록하면 이 파일의 @app.post("/api/ai/report/subject-recommend")를
@@ -134,6 +150,9 @@ app.state.writing_tokenizer = tokenizer
 
 # 개념 설명에 중국어·일본어 등 다른 문자가 섞이지 않게 해당 토큰을 막는다(script_guard.py).
 _FOREIGN_BLOCKER = ForeignScriptBlocker(foreign_token_mask(tokenizer, base_model.config.vocab_size))
+
+# GPU 생성은 한 번에 하나씩 (_concept_explain 참고).
+_GEN_LOCK = threading.Lock()
 
 
 _SUBJECT_DEFAULT_CONCEPT: dict[str, str] = {
@@ -246,12 +265,16 @@ def _concept_explain(subject: str, concept_query: str,
                     pad_token_id=tokenizer.eos_token_id,
                 )
 
-        if adapter_name is None:
-            with model.disable_adapter():
+        # 요청마다 threadpool 스레드에서 돈다. disable_adapter()·set_adapter()는 모델 하나의
+        # 상태를 바꾸므로 동시에 두 요청이 들어오면 서로의 어댑터 설정을 덮는다. GPU도 하나라
+        # 동시에 돌려도 빨라지지 않으니 한 번에 하나씩 생성한다.
+        with _GEN_LOCK:
+            if adapter_name is None:
+                with model.disable_adapter():
+                    outputs = _gen()
+            else:
+                model.set_adapter(adapter_name)
                 outputs = _gen()
-        else:
-            model.set_adapter(adapter_name)
-            outputs = _gen()
 
         text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
         text = strip_markdown(text)
@@ -268,6 +291,34 @@ def _concept_explain(subject: str, concept_query: str,
 
 # counseling 라우터가 main을 import하면 순환 참조가 되므로 registry를 통해 넘긴다.
 model_registry.register("concept_explain", _concept_explain)
+
+
+def _warm_up() -> None:
+    """기동 직후 첫 요청이 느리지 않게 Qwen을 한 번 돌리고 Ollama 모델을 올려 둔다.
+    첫 생성은 CUDA 커널 준비로 수 초가 더 들고, Ollama는 모델을 처음 올릴 때 수 초가 든다.
+    Backend의 개념 추천 대기 한도가 50초(CloudFront 60초 아래)라 그 수 초가 폴백을 부를 수 있다."""
+    import logging
+    import time
+    import httpx
+    from src.api.generation import OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_URL
+
+    t = time.time()
+    try:
+        ids = tokenizer("안녕하세요", return_tensors="pt").to("cuda")
+        with _GEN_LOCK, torch.no_grad(), base_model.disable_adapter():
+            base_model.generate(**ids, max_new_tokens=8, do_sample=False,
+                                pad_token_id=tokenizer.eos_token_id)
+        # prompt 없이 보내면 생성 없이 모델만 올린다(Ollama API).
+        httpx.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "keep_alive": OLLAMA_KEEP_ALIVE},
+                   timeout=120)
+        print(f"🔥 예열 완료 ({time.time() - t:.1f}초)")
+    except Exception as e:
+        logging.warning(f"[예열] 실패 — 첫 요청이 느릴 수 있습니다: {e}")
+
+
+@app.on_event("startup")
+async def _startup_warm_up():
+    await run_in_threadpool(_warm_up)
 
 
 @app.post("/api/ai/report/subject-recommend")

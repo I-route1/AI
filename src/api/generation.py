@@ -17,3 +17,6 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.1:latest"
 # num_ctx: 참고 자료가 붙으면 한국어가 2천 토큰 가까이 된다.
 OLLAMA_OPTIONS = {"num_predict": 400, "temperature": 0.4, "num_ctx": 4096}
+# Ollama는 기본으로 5분 쉬면 모델을 내린다. 다시 올리는 데 수 초가 들어 요청이 드문 시연 중에
+# 첫 리포트가 20초 타임아웃에 걸릴 수 있다. 서버가 떠 있는 동안은 올려 둔다.
+OLLAMA_KEEP_ALIVE = "2h"
