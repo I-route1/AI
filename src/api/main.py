@@ -39,7 +39,8 @@ from src.api.routers import counseling, predictor, writing, rag
 from src.api.routers.counseling import _ollama_analyze
 from src.api.generation import ADVICE_GEN, CONCEPT_GEN
 from src.api.postprocess import strip_markdown, trim_cut_tail
-from src.api.script_guard import ForeignScriptBlocker, foreign_token_mask, has_foreign, strip_foreign
+from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
+                                  latin_token_mask, strip_foreign)
 from transformers import LogitsProcessorList
 from src.api.routers.rag import subject_aware_search as _subject_aware_search
 from src.api.java_client import get_student_weakness_from_java
@@ -151,6 +152,20 @@ app.state.writing_tokenizer = tokenizer
 # 개념 설명에 중국어·일본어 등 다른 문자가 섞이지 않게 해당 토큰을 막는다(script_guard.py).
 _FOREIGN_BLOCKER = ForeignScriptBlocker(foreign_token_mask(tokenizer, base_model.config.vocab_size))
 
+# 국어·사회는 설명에 영어가 나올 이유가 없어 한 단계 더 막는다("갈Conflict", "속belongs합니다"
+# 같은 사례가 있었다 — script_guard._LATIN 설명 참고). 수학(D, x)·과학(DNA, pH)·영어 과목은
+# 정상적으로 영문자가 필요해서 이 목록에 안 넣는다.
+_LATIN_BLOCKER = ForeignScriptBlocker(latin_token_mask(tokenizer, base_model.config.vocab_size))
+_NO_LATIN_SUBJECTS = frozenset({"국어", "사회"})
+
+
+def _script_blockers(subject: str | None) -> "LogitsProcessorList":
+    processors = [_FOREIGN_BLOCKER]
+    if subject in _NO_LATIN_SUBJECTS:
+        processors.append(_LATIN_BLOCKER)
+    return LogitsProcessorList(processors)
+
+
 # GPU 생성은 한 번에 하나씩 (_concept_explain 참고).
 _GEN_LOCK = threading.Lock()
 
@@ -261,7 +276,7 @@ def _concept_explain(subject: str, concept_query: str,
                 return model.generate(
                     **inputs,
                     **CONCEPT_GEN,  # 한도·온도는 generation.py (200토큰에서 전부 잘렸다)
-                    logits_processor=LogitsProcessorList([_FOREIGN_BLOCKER]),
+                    logits_processor=_script_blockers(subject),
                     pad_token_id=tokenizer.eos_token_id,
                 )
 
@@ -299,8 +314,12 @@ ADVICE_SYSTEM_PROMPT = (
 )
 
 
-def _qwen_advice(prompt: str) -> str | None:
+def _qwen_advice(prompt: str, subject: str | None = None) -> str | None:
     """수학/writing/premium 리포트의 학습 조언 문단 생성. 실패하면 None(호출부가 Ollama로 대체).
+
+    subject: 리포트가 다루는 과목(수학/국어/premium이면 _premium_subject 결과). 국어·사회면
+    _script_blockers()가 영문자도 막는다 — 이 조언 문단에는 수학 공식(D, x) 같은 정당한
+    이유가 없어서 섞이면 전부 결함이다.
 
     2026-09-28: 이 세 리포트는 원래 Ollama(llama3.1)만 썼다 — 한국사 개념 설명에서
     Ollama가 사실 정확도로 이겨서(MODELS.md "베이스 Qwen으로 바꾸지 않은 이유") 조언
@@ -329,7 +348,7 @@ def _qwen_advice(prompt: str) -> str | None:
                 return base_model.generate(
                     **inputs,
                     **ADVICE_GEN,
-                    logits_processor=LogitsProcessorList([_FOREIGN_BLOCKER]),
+                    logits_processor=_script_blockers(subject),
                     pad_token_id=tokenizer.eos_token_id,
                 )
 

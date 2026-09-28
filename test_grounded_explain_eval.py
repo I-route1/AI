@@ -86,13 +86,18 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
     from src.api.grounding import concept_user_message, context_block
     from src.api.postprocess import strip_markdown, trim_cut_tail
     from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
-                                      strip_foreign)
+                                      latin_token_mask, strip_foreign)
+
+    # 국어·사회는 개념 설명에 영어가 나올 이유가 없어 영문자 토큰도 막는다(main._NO_LATIN_SUBJECTS
+    # 와 같은 목록) — 실제로 "갈Conflict", "속belongs합니다" 같은 섞임이 있었다. 이 목록이
+    # main.py와 어긋나면 평가가 서빙과 다른 조건을 재는 것이니 같이 고칠 것.
+    _NO_LATIN_SUBJECTS = frozenset({"국어", "사회"})
 
     rows = json.load(open(ctx_path, encoding="utf-8"))
     if only:  # 쉼표로 구분한 개념 이름 — 항목 하나를 고친 뒤 그 개념만 다시 볼 때
         wanted = set(only.split(","))
         rows = [r for r in rows if r["concept"] in wanted]
-    tok = model = blocker = None
+    tok = model = blocker = latin_blocker = None
     if any(r["subject"] != "한국사" for r in rows):
         tok = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
         model = AutoModelForCausalLM.from_pretrained(
@@ -101,6 +106,7 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
                                                    bnb_4bit_compute_dtype=torch.bfloat16,
                                                    bnb_4bit_use_double_quant=True)).eval()
         blocker = ForeignScriptBlocker(foreign_token_mask(tok, model.config.vocab_size))
+        latin_blocker = ForeignScriptBlocker(latin_token_mask(tok, model.config.vocab_size))
 
     def qwen(subject: str, concept: str, docs: list[str]) -> tuple[str, int, bool]:
         sysp = MATH_SYSTEM_PROMPT if subject == "수학" else SUBJECT_ADAPTERS[subject][2]
@@ -109,9 +115,10 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
         ids = tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                           enable_thinking=False),
                   return_tensors="pt", truncation=True, max_length=2048).to("cuda")
+        processors = [blocker] + ([latin_blocker] if subject in _NO_LATIN_SUBJECTS else [])
         with torch.no_grad():
             out = model.generate(**ids, **CONCEPT_GEN_GREEDY, pad_token_id=tok.eos_token_id,
-                                 logits_processor=LogitsProcessorList([blocker]))
+                                 logits_processor=LogitsProcessorList(processors))
         n = out.shape[-1] - ids["input_ids"].shape[-1]
         text = strip_markdown(tok.decode(out[0][ids["input_ids"].shape[-1]:], skip_special_tokens=True))
         if n >= CONCEPT_GEN_GREEDY["max_new_tokens"]:

@@ -23,6 +23,12 @@ _FOREIGN = re.compile(f"[{_FOREIGN_CHARS}]")
 _FOREIGN_RUN = re.compile(f"[{_FOREIGN_CHARS}]+")
 _PAREN_HANJA = re.compile(r"\([㐀-䶿一-鿿豈-﫿·,\s]+\)")
 
+# 영문자. 위 _FOREIGN에는 안 든다 — 수학(D, x 같은 변수)·과학(DNA, pH, mRNA)·영어 과목은
+# 정상적으로 영문자가 필요해서 전 과목에 일괄 적용할 수 없다. 국어·사회처럼 영문자가 나올
+# 이유가 없는 과목에서만 latin_token_mask()로 따로 막는다(main._NO_LATIN_SUBJECTS).
+# 실제로 섞인 예: "갈Conflict"(갈등), "속belongs합니다"(속한다), 사이시옷 예시의 "ㅆ"이 "sst"로.
+_LATIN = re.compile("[A-Za-z]")
+
 
 def has_foreign(text: str) -> bool:
     """괄호 안 한자 병기를 뺀 나머지에 다른 문자가 있는가."""
@@ -48,6 +54,16 @@ def foreign_token_mask(tokenizer, vocab_size: int) -> torch.Tensor:
     mask = torch.zeros(vocab_size, dtype=torch.bool)
     for i in range(min(len(tokenizer), vocab_size)):
         if _FOREIGN.search(tokenizer.decode([i])):
+            mask[i] = True
+    return mask
+
+
+def latin_token_mask(tokenizer, vocab_size: int) -> torch.Tensor:
+    """영문자가 든 토큰 위치가 True인 마스크. foreign_token_mask와 같은 방식이지만
+    국어·사회처럼 영문자가 나올 이유가 없는 과목에서만 추가로 쓴다(위 _LATIN 설명)."""
+    mask = torch.zeros(vocab_size, dtype=torch.bool)
+    for i in range(min(len(tokenizer), vocab_size)):
+        if _LATIN.search(tokenizer.decode([i])):
             mask[i] = True
     return mask
 
