@@ -13,6 +13,11 @@ CONCEPT_GEN = dict(max_new_tokens=800, temperature=0.3, do_sample=True, repetiti
 # 평가용 결정적 디코딩. 한도와 반복 벌점은 서빙과 같다.
 CONCEPT_GEN_GREEDY = dict(max_new_tokens=800, do_sample=False, repetition_penalty=1.2)
 
+# 수학·writing·premium 리포트의 학습 조언 문단(_qwen_advice, counseling._ADVICE_RULES).
+# 개념 설명이 아니라 "2~3문장, 무엇을 얼마나 자주" 정도라 800토큰까지 필요 없다. 300으로
+# 두면 Ollama(num_predict 400)와 비슷한 분량에서 끊긴다.
+ADVICE_GEN = dict(max_new_tokens=300, temperature=0.4, do_sample=True, repetition_penalty=1.2)
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.1:latest"
 # num_ctx: 참고 자료가 붙으면 한국어가 2천 토큰 가까이 된다.

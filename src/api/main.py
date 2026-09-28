@@ -37,7 +37,7 @@ from src.api.adapters import (
 )
 from src.api.routers import counseling, predictor, writing, rag
 from src.api.routers.counseling import _ollama_analyze
-from src.api.generation import CONCEPT_GEN
+from src.api.generation import ADVICE_GEN, CONCEPT_GEN
 from src.api.postprocess import strip_markdown, trim_cut_tail
 from src.api.script_guard import ForeignScriptBlocker, foreign_token_mask, has_foreign, strip_foreign
 from transformers import LogitsProcessorList
@@ -291,6 +291,64 @@ def _concept_explain(subject: str, concept_query: str,
 
 # counseling 라우터가 main을 import하면 순환 참조가 되므로 registry를 통해 넘긴다.
 model_registry.register("concept_explain", _concept_explain)
+
+
+ADVICE_SYSTEM_PROMPT = (
+    "당신은 학생을 직접 상담하는 친절한 학습 코치입니다. "
+    "질문에 대해 한국어로, 학생에게 말하듯 간결하고 구체적으로 답하세요."
+)
+
+
+def _qwen_advice(prompt: str) -> str | None:
+    """수학/writing/premium 리포트의 학습 조언 문단 생성. 실패하면 None(호출부가 Ollama로 대체).
+
+    2026-09-28: 이 세 리포트는 원래 Ollama(llama3.1)만 썼다 — 한국사 개념 설명에서
+    Ollama가 사실 정확도로 이겨서(MODELS.md "베이스 Qwen으로 바꾸지 않은 이유") 조언
+    문단도 손대지 않았는데, 그건 별개 질문이다. 여기는 사실을 설명하는 게 아니라
+    프로필(백분위·학습시간·강사 피드백)을 보고 조언 문장을 만드는 일이라 사실 오류로
+    틀릴 일이 적고, 학생 4명 프로필로 비교했을 때 Ollama와 맞먹는 조언을 냈다.
+
+    _concept_explain()과 달리 어댑터를 쓰지 않고 항상 베이스로 생성한다 — 조언 문단은
+    개념 설명이 아니라 자유 형식 답변이라 과목 어댑터의 학습 형식(정답/풀이 등)과 맞지
+    않는다. 프롬프트(질문+분량 지시)는 호출부(counseling.py)가 이미 만들어 그대로 받는다.
+    """
+    import logging
+    try:
+        messages = [
+            {"role": "system", "content": ADVICE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        chat = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = tokenizer(chat, return_tensors="pt", truncation=True, max_length=1024).to("cuda")
+        input_len = inputs["input_ids"].shape[-1]
+
+        def _gen():
+            with torch.no_grad():
+                return base_model.generate(
+                    **inputs,
+                    **ADVICE_GEN,
+                    logits_processor=LogitsProcessorList([_FOREIGN_BLOCKER]),
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+
+        with _GEN_LOCK, base_model.disable_adapter():
+            outputs = _gen()
+
+        text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        text = strip_markdown(text)
+        if outputs.shape[-1] - input_len >= ADVICE_GEN["max_new_tokens"]:
+            text = trim_cut_tail(text)
+        if has_foreign(text):
+            text = strip_foreign(text).strip()
+        return text or None
+    except Exception as e:
+        logging.warning(f"[학습 조언] 생성 실패: {e}")
+        return None
+
+
+model_registry.register("qwen_advice", _qwen_advice)
 
 
 def _warm_up() -> None:

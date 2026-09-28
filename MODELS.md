@@ -25,7 +25,7 @@ unsloth/Qwen3-8B-unsloth-bnb-4bit  (4bit NF4, bf16 compute, double quant)
 └── social   train/social_adapter_qwen            〃
 ```
 
-### 실제로 호출되는 경로 (2026-09-23, Backend·Front 코드 기준)
+### 실제로 호출되는 경로 (2026-09-28, Backend·Front 코드 기준)
 
 Backend(`I-route1/Backend`)가 AI 서버에 보내는 요청과 각 요청이 쓰는 모델입니다.
 Front(`I-route1/Front`)는 AI 서버를 직접 호출하지 않습니다.
@@ -34,8 +34,13 @@ Front(`I-route1/Front`)는 AI 서버를 직접 호출하지 않습니다.
 |---|---|
 | `/api/ai/report/subject-recommend` | 베이스 Qwen (`_concept_explain`), 한국사만 Ollama |
 | `/api/ai/report/{영어·과학·사회·한국사}` | 베이스 Qwen (`_concept_explain`), 한국사만 Ollama |
-| `/api/ai/report/math`, `/report/writing`, `/report/premium` | 규칙 기반 + **Ollama** `llama3.1` (개념은 `_resolve_concept`로 정함 — recommendContext는 수준 라벨) |
+| `/api/ai/report/math`, `/report/writing`, `/report/premium` | 규칙 기반 + 베이스 Qwen (`_qwen_advice`), 실패 시 Ollama `llama3.1`로 대체 (개념은 `_resolve_concept`로 정함 — recommendContext는 수준 라벨) |
 | `/api/ai/search`, `/api/rag/search` | RAG만 (생성 없음) |
+
+**한국사만 Ollama를 그대로 씁니다.** 개념 설명은 사실 정확도 때문에 예전부터 그랬고
+(아래 "한국사 개념 설명" 절), math/writing/premium의 학습 조언 문단은 개념 설명이
+아니라 프로필 기반 조언이라 별도로 재서 Qwen으로 옮겼습니다(아래 "학습 조언 문단"
+절). 한국사가 Ollama에 남아 있는 한 Ollama 서버 자체를 없앨 수는 없습니다.
 
 **`/api/writing/*`(evaluate·irt·curriculum·compare·weakness-report)는 어느
 클라이언트도 호출하지 않습니다.** Backend의 "writing"은 국어 리포트
@@ -979,6 +984,59 @@ ConceptMap 42개 개념으로, 지금 서빙 중인 Ollama(두 경로의 실제 
 > 다른 과목의 사실 정확도는 아래 "개념 설명에 ConceptMap 근거 붙이기" 절에서
 > 확인했습니다.
 
+### math/writing/premium 학습 조언 문단: Ollama → 베이스 Qwen (2026-09-28)
+
+위 절의 결론(한국사는 Ollama)과 math/writing/premium 리포트의 "학습 조언" 문단은
+**다른 질문**이다. 개념 설명은 사실(연도·정의·사건)을 말해야 해서 근거 없는 모델은
+틀리기 쉽지만, 이 세 리포트의 조언 문단은 학생 프로필(백분위·학습시간·강사 피드백)을
+보고 "무엇을 얼마나 자주 하라"는 문장을 만드는 일이라 사실 오류로 틀릴 일이 적다.
+그런데도 세 리포트 모두 처음부터 Ollama만 썼다 — 손대지 않았을 뿐 따로 재본 적이
+없었다.
+
+`test_advice_llm_compare.py`로 Backend 더미 데이터 모양의 학생 4명(상위권·성실,
+중위권·학습량 부족, 하위권·강사 피드백 있음, 데이터 없음)에 대해 세 리포트가 실제로
+만드는 프롬프트를 그대로 베이스 Qwen(`_qwen_advice`, 신규)과 Ollama 양쪽에 넣어
+비교했다(12개 프롬프트 × 2모델).
+
+| | Qwen | Ollama |
+|---|---|---|
+| 평균 소요 | 4.6초 | 1.5초 |
+| "목록 기호 없이·질문 반복 금지" 지시 위반 | 0/12 | 4/12(번호 목록 2건, 질문·서두 반복 2건) |
+| 같은 항목에 서로 다른 숫자(예: "30개씩"…"10개씩") | 0/12 | 3/12 |
+| 사실·설명이 이상함(지어낸 "실수", 존재하지 않는 단어) | 1/12("줴리아나"라는 없는 단어) | 1/12("고전시가"를 "고전적 시가"로 오해한다는 지어낸 실수) |
+
+**Qwen을 기본으로 하고 Ollama를 대체값으로 남겼다** (`counseling._advice`: Qwen
+먼저 시도, 실패하면 Ollama). 근거:
+
+- 옛 프롬프트를 고치며 넣은 지시("3문장 이내, 목록 기호 없이, 질문 반복 금지" —
+  `_ADVICE_RULES`, 위 "writing·premium 학습 조언 프롬프트" 절)를 Ollama는 12개 중
+  4개에서 어겼다(번호 매긴 목록으로 쓰거나, "학생에게 말할 수 있는 내용은 다음과
+  같습니다"로 질문을 되풀이하거나, 같은 문장을 서두와 결론에 반복). Qwen은 하나도
+  어기지 않았다.
+- Ollama는 같은 문장 안에서 빈도·분량 숫자가 어긋나는 경우가 있었다("매일 고전시가
+  어휘 30개씩... 매일 10개씩 외우고, 1주일에 60개가 되도록" — 30과 10과 60이 서로
+  안 맞는다). Qwen에서는 이런 숫자 불일치가 없었다.
+- 수학 조언에서 Qwen은 실제 공식(`D = b² - 4ac`)을 써서 구체적이었고, Ollama는
+  "'고전시가'를 '고전적 시가'로 오해한다"처럼 실제로 일어나지 않을 법한 실수를
+  지어내는 경우가 있었다.
+- 속도는 Ollama가 3배가량 빠르다(평균 1.5초 대 4.6초). 하지만 이 세 리포트는
+  Backend `AiCounselingService` 경로라 타임아웃이 180초다(subject-recommend의
+  50초 한도와 다르다 — "시연 준비" 절). +3초는 예산 안에서 문제가 안 된다.
+- Qwen도 결함이 없지는 않다 — 12개 중 1개에서 없는 단어("줴리아나")를 만들어
+  냈다. 이건 사실 오류를 잡는 근거 붙이기(`grounding.py`)로 막을 수 있는 종류가
+  아니라 조언 자체를 지어내는 것이라, 발생하면 `_advice()`의 대체 경로(Ollama)로
+  넘어가지 않는다(생성 자체는 성공했으므로). 드물게 나오는 것을 확인했을 뿐
+  막지는 못했다.
+- 어댑터를 쓰지 않는다 — 조언 문단은 개념 설명이 아니라 자유 형식 답변이라 math
+  어댑터의 "정답:/풀이:" 형식과 맞지 않는다(`_math_report()`가 애초에 math
+  어댑터를 안 쓰는 이유와 같다).
+
+**GPU 부담.** `_qwen_advice`도 `_GEN_LOCK`을 공유해 개념 설명과 한 번에 하나씩만
+생성한다. 예전에는 이 세 리포트가 Ollama만 써서 개념 설명(Qwen)과 동시에 돌 수
+있었는데, 이제는 그 병렬성이 없다. 한 요청 안에서는 문제가 안 되지만(리포트 하나가
+Qwen 호출을 두 번 하지 않는다), 서로 다른 리포트 요청이 겹치면 GPU 앞에서 순서를
+기다린다. RTX 5070 Ti 한 장이라 어차피 동시에 돌려도 빨라지진 않는다.
+
 ### 개념 설명에 ConceptMap 근거 붙이기 (2026-09-23)
 
 ```
@@ -1567,17 +1625,22 @@ ConceptMap을 FAISS보다 우선하는 것은 의도된 설계입니다. 손으�
 
 ## Ollama 의존성
 
-Ollama(`localhost:11434`의 `llama3.1:latest`)는 폴백이 아니라 **주 경로**이기도
-합니다.
+Ollama(`localhost:11434`의 `llama3.1:latest`)는 이제 **대체 경로**입니다
+(2026-09-28 이전에는 math/writing/premium의 주 경로였습니다 — 위 "math/writing/
+premium 학습 조언 문단" 절).
 
 - `/api/ai/report/math`, `/report/writing`, `/report/premium`의 LLM 문단은
-  **Ollama만** 씁니다.
-- 개념 설명(`_concept_explain`)은 한국사와 생성 실패 시 Ollama로 넘어갑니다.
+  베이스 Qwen(`_qwen_advice`)을 먼저 쓰고, 미등록이거나 생성에 실패하면
+  Ollama로 넘어갑니다(`counseling._advice`).
+- 개념 설명(`_concept_explain`)은 한국사와 생성 실패 시 여전히 Ollama로 넘어갑니다
+  — 한국사는 사실 정확도 때문에 그대로 둡니다(위 "한국사 개념 설명" 절).
 - Backend의 `MathAiService`도 Ollama를 직접 호출합니다.
 
-**Ollama가 없으면 에러 없이 조용히 해당 섹션이 사라집니다** (`_ollama_analyze`가
-`None`을 반환하고 호출부가 생략). 리포트에 "AI 개념 분석"이 안 보이면 Ollama부터
-확인하세요.
+**Ollama가 없어도 리포트는 나옵니다**(math/writing/premium은 Qwen이 대신 만듭니다).
+다만 한국사 개념 설명은 Ollama가 없으면 에러 없이 조용히 해당 섹션이 사라집니다
+(`_ollama_analyze`가 `None`을 반환하고 호출부가 생략). 한국사 리포트에 "AI 개념
+분석"이 안 보이면 Ollama부터 확인하세요. 한국사가 Ollama에 남아 있는 한 Ollama
+서버 자체를 없앨 수는 없습니다.
 
 ---
 

@@ -79,6 +79,18 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
     return None
 
 
+async def _advice(prompt: str) -> str | None:
+    """수학/writing/premium 리포트의 학습 조언 문단. 베이스 Qwen(main._qwen_advice)을 먼저
+    쓰고, 미등록이거나(TestClient로 이 라우터만 띄운 경우) 생성에 실패하면 Ollama로 대체한다.
+    report_subject()가 concept_explain을 쓰는 것과 같은 순서다(2026-09-28 비교)."""
+    qwen_advice = model_registry.get("qwen_advice")
+    if qwen_advice:
+        result = await run_in_threadpool(qwen_advice, prompt)
+        if result:
+            return result
+    return await _ollama_analyze(prompt)
+
+
 def _level_label(percentile: float) -> str:
     if percentile >= 90: return "최상위권"
     if percentile >= 75: return "상위권"
@@ -427,7 +439,7 @@ async def report_math(req: dict):
             f"이 개념에서 학생들이 가장 자주 하는 핵심 실수 1가지와 "
             f"그것을 극복하는 구체적인 학습 전략을 2~3문장으로 간결하게 한국어로 답해주세요."
         )
-        llm_insight = await _ollama_analyze(prompt)
+        llm_insight = await _advice(prompt)
         if llm_insight:
             result["careerAnalysis"] += f"\n\n[AI 개념 심층 분석]\n{llm_insight}"
     return result
@@ -445,7 +457,7 @@ async def report_writing(req: dict):
         f"학생 특성: '{note or '특이사항 없음'}'.{_feedback_clause(req)} "
         f"이 학생의 국어(문학·비문학·작문) 실력을 올릴 구체적인 공부 방법 2가지를{_ADVICE_RULES}"
     )
-    llm_insight = await _ollama_analyze(prompt)
+    llm_insight = await _advice(prompt)
     if llm_insight:
         result["careerAnalysis"] += f"\n\n[AI 맞춤 학습 제안]\n{llm_insight}"
     return result
@@ -465,7 +477,7 @@ async def report_premium(req: dict):
         f"취약 개념: '{concept or '특정되지 않음'}', 특성: '{note or '없음'}'.{_feedback_clause(req)} "
         f"이 학생이 성적을 올리려면 이번 주에 가장 먼저 해야 할 행동 2가지를{_ADVICE_RULES}"
     )
-    llm_insight = await _ollama_analyze(prompt)
+    llm_insight = await _advice(prompt)
     if llm_insight:
         result["careerAnalysis"] += f"\n\n[AI 우선순위 행동 제안]\n{llm_insight}"
     return result
