@@ -50,20 +50,27 @@ def strip_foreign(text: str) -> str:
 
 
 def foreign_token_mask(tokenizer, vocab_size: int) -> torch.Tensor:
-    """다른 문자가 든 토큰 위치가 True인 마스크. 어휘 15만 개를 한 번 디코드한다(수 초)."""
+    """다른 문자가 든 토큰 위치가 True인 마스크. 어휘 15만 개를 한 번 디코드한다(수 초).
+
+    skip_special_tokens=True로 디코드한다 — False(기본값)로 하면 EOS가 "<|im_end|>"로
+    나와 "im"/"end"에 영문자가 있다. latin_token_mask가 그걸 몰라서 막았더니 모델이 끝을
+    선택 못 해 매번 800토큰(한도)까지 채운 적이 있다. foreign_token_mask는 지금 이 어휘의
+    특수 토큰에 한자·가나 등이 없어 우연히 문제가 없었지만, 같은 함정이라 여기도 맞춘다.
+    """
     mask = torch.zeros(vocab_size, dtype=torch.bool)
     for i in range(min(len(tokenizer), vocab_size)):
-        if _FOREIGN.search(tokenizer.decode([i])):
+        if _FOREIGN.search(tokenizer.decode([i], skip_special_tokens=True)):
             mask[i] = True
     return mask
 
 
 def latin_token_mask(tokenizer, vocab_size: int) -> torch.Tensor:
     """영문자가 든 토큰 위치가 True인 마스크. foreign_token_mask와 같은 방식이지만
-    국어·사회처럼 영문자가 나올 이유가 없는 과목에서만 추가로 쓴다(위 _LATIN 설명)."""
+    국어·사회처럼 영문자가 나올 이유가 없는 과목에서만 추가로 쓴다(위 _LATIN 설명).
+    skip_special_tokens=True인 이유는 foreign_token_mask 설명 참고 — EOS를 막지 않기 위함."""
     mask = torch.zeros(vocab_size, dtype=torch.bool)
     for i in range(min(len(tokenizer), vocab_size)):
-        if _LATIN.search(tokenizer.decode([i])):
+        if _LATIN.search(tokenizer.decode([i], skip_special_tokens=True)):
             mask[i] = True
     return mask
 
