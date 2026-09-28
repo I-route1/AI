@@ -21,8 +21,8 @@ Ollama는 temperature 0·seed 고정이다. 그래도 Ollama는 실행마다 조
 FAISS(69만 벡터)와 8B 모델을 한 프로세스에 올리지 않도록 두 단계로 나눈다.
     python test_grounded_explain_eval.py retrieve train/fact_ctx.json
     python test_grounded_explain_eval.py generate train/fact_ctx.json train/fact_out.json
-    # 기준 출력(eval/fact_out_20260925.json, 판정 73.5/79)과 비교 — 달라진 것만 판정하면 된다
-    python test_grounded_explain_eval.py compare  eval/fact_out_20260925.json train/fact_out.json
+    # 기준 출력(eval/fact_out_20260928.json, 판정 77/79)과 비교 — 달라진 것만 판정하면 된다
+    python test_grounded_explain_eval.py compare  eval/fact_out_20260928.json train/fact_out.json
     # 일부 개념만 (쉼표 구분)
     python test_grounded_explain_eval.py generate train/fact_ctx.json train/fact_part.json "사이시옷,균역법"
 """
