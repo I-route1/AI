@@ -1524,6 +1524,27 @@ what은 9-28에 고쳤습니다** (위 "math/writing/premium 학습 조언 문�
 새로 틀린 개념이 없었다. 합계 77.5/79(98%). 남은 △ 3건(비와 비율 계산, 관계부사
 where/when, 강화도 천도)은 위에서 설명한 대로 항목을 고쳐도 잘 안 막히는 종류다.
 
+**2026-09-29: 한국사 과목을 삭제했다.** 사용자 지시로 한국사를 지원 과목에서 뺐다(바로
+위 두 절에서 보듯 어댑터도 FAISS 코퍼스도 없어 ConceptMap 하나에만 의존했고, 그 ConceptMap을
+고칠 때마다 다른 과목 검색이 흔들리는 부작용이 반복됐다). 같이 지시받은 "수학·국어·프리미엄
+Qwen 전환"은 9-28에 이미 끝나 있었다(위 "math/writing/premium 학습 조언 문단" 절) — 그래서
+이번엔 한국사 삭제만 새로 했다.
+
+- `concept_map.py`: 한국사 52개 항목 전부 삭제(5과목만 남음: 국어·수학·영어·과학·사회).
+- `main.py`/`rag.py`/`counseling.py`: `_SUBJECT_DEFAULT_CONCEPT`·`_SUBJECT_STRATEGY`·
+  `_SUBJECT_PATH_PATTERNS`·`_SUBJECT_KEYWORDS`·`_DEFAULT_QUERY`·`_MISTAKE_TYPES`·`_STRATEGY`에서
+  한국사 키 제거 — `/api/ai/report/한국사`는 이제 다른 미지원 과목과 똑같이 404.
+- FAISS: `[대상]한국사`로 시작하는 문서 112건을 지워 698,459 → **698,347**벡터로 되돌림(한국사
+  추가 이전 상태).
+- 평가: `test_korean_history_explain_eval.py` 삭제, `test_grounded_explain_eval.py`에서
+  `history`/`history_faiss` 그룹(32개) 제거해 79 → **47개 개념**으로 줄임,
+  `eval/fact_judgments.json`도 한국사 32건을 지워 새 합계 **46/47(97.9%)**. 남은 △는 비와
+  비율 계산·관계부사 where/when 2건뿐(강화도 천도는 한국사와 함께 사라짐).
+- Backend(`AiCounselingService`의 `SUBJECT_REPORT_SUPPORTED`, `AiReportController`의 리포트
+  문구, `GradeAnalysisService`의 `detectSubject`/정규식)에서도 한국사를 같이 뺐다.
+- Ollama는 그대로 남는다 — math/writing/premium의 `_advice()` 폴백(위 "Ollama 의존성" 절)은
+  한국사와 무관하게 독립적으로 남아 있는 경로라, 한국사를 지워도 Ollama 자체를 없앨 수는 없다.
+
 ### 2026-09-26 시연 준비: 시간 한도·공유 키·과목별 성적
 
 Backend(로컬 8080)와 이 서버를 함께 띄우고, 테스트 학생 1로 리포트 7종과 개념 추천 3건을
@@ -1540,7 +1561,8 @@ Ollama는 기본으로 5분 쉬면 모델을 내리므로 `keep_alive`를 2시�
 
 **생성 잠금.** `_concept_explain`은 threadpool에서 돌고, `disable_adapter()`·`set_adapter()`는
 모델 하나의 상태를 바꾼다. 요청 두 개가 겹치면 서로의 어댑터 설정을 덮으므로 `_GEN_LOCK`으로
-한 번에 하나씩 생성한다. GPU가 하나라 동시에 돌려도 빨라지지 않는다.
+한 번에 하나씩 생성한다. GPU가 하나라 동시에 돌려도 빨라지지 않는다. 토크나이저용
+`_TOK_LOCK`과 함께 지금은 `src/api/gen_lock.py`에 있다(아래 "폴백 카운터와 부하 측정" 절).
 
 **공유 키.** ngrok으로 열면 주소만 알아도 GPU 생성을 부를 수 있었다. `.env`에 `AI_SERVER_KEY`가
 있으면 `/api/` 요청에 같은 값의 `X-AI-Key` 헤더를 요구한다(없으면 401). Backend는 같은 이름의
@@ -1556,6 +1578,81 @@ Ollama는 기본으로 5분 쉬면 모델을 내리므로 `keep_alive`를 2시�
 **프리미엄 주 과목.** `recommendContext`는 수준 라벨이라 "영어"·"국어"가 들어갈 일이 없어 늘
 수학이었다. Backend가 오답 `failCount` 합이 가장 큰 과목을 `weakSubject`로 넘기고, 그 과목의
 개념(`weakConcept`)과 백분위를 함께 넘긴다.
+
+### 2026-09-29 폴백 카운터와 부하 측정
+
+Qwen 생성이 실패해 Ollama나 규칙 기반 문구로 넘어가는 일이 얼마나 되는지 재 본 적이 없어서,
+카운터를 넣고 실제 앱으로 재 봤다.
+
+**폴백 카운터** (`src/api/fallback_stats.py`). 생성 경로의 결과를 종류별로 센다.
+
+| 종류 | 경로 |
+|---|---|
+| `advice` | `/report/math`, `/report/writing`, `/report/premium` (`counseling._advice`) |
+| `concept` | `/report/{영어·과학·사회}`, `subject-recommend` (`_concept_explain`) |
+
+결과는 `qwen`(성공), `ollama`(Qwen 실패 후 Ollama 성공), `none`(Ollama도 실패해 규칙 기반
+문구만)이다. `GET /api/ai/stats/fallback`이 `{종류: {qwen, ollama, none, total, fallback_rate}}`를
+돌려주고, Qwen이 아닌 결과가 날 때마다 `[폴백] ...` 경고를 로그에 남긴다. 프로세스 메모리에만
+있어 서버를 다시 띄우면 0으로 돌아간다. 취약 개념이 없어 모델을 부르지 않은 요청은 세지 않는다.
+
+**순차 42건** (학생 5명 프로필 × 리포트 6종 30건 + `subject-recommend` 12건, 한 번에 한 건씩,
+실제 `main.app`을 in-process로 호출):
+
+| | 건수 | Qwen 성공 | 폴백 |
+|---|---|---|---|
+| `advice` | 15 | 15 | 0 |
+| `concept` | 27 | 27 | 0 |
+
+전부 HTTP 200이고, AI 문단이 빈 응답, 다른 문자(일본어·한자 등) 섞임, 국어·사회 문단의 영문자는
+0건이다. 소요 시간(중앙값 / 최대, 초)은 math 5.3 / 6.2, writing 4.0 / 4.5, premium 3.4 / 5.8,
+영어 15.5 / 26.5, 과학 17.9 / 19.6, 사회 14.1 / 24.5이고, `subject-recommend`는 수학 20.1 / 35.7,
+영어 15.3 / 17.4, 과학 19.3 / 21.9, 사회 16.6 / 23.7이다. 가장 느린 요청(35.7초)도 Backend
+한도(50초)까지 14초가 남았다.
+
+**동시 요청** (같은 순간에 N명이 누르는 상황). 생성은 `_GEN_LOCK`으로 한 번에 하나씩이라
+마지막 요청이 앞 요청을 모두 기다린다. 아래는 바로 뒤에 적은 결함을 고친 뒤의 값이다.
+
+| 시나리오 | 응답 시간(초, 빠른 순) | 50초 초과 | 폴백 |
+|---|---|---|---|
+| 수학 추천 3명 | 13, 38, 71 | 1 | 0 |
+| 수학 추천 5명 | 13, 32, 63, 89, 114 | 3 | 0 |
+| 영어·과학·사회·math·premium 혼합 3명 | 15, 29, 44 | 0 | 0 |
+| 같은 혼합 5명 | 5, 21, 25, 43, 62 | 1 | 0 |
+
+수학 추천은 생성 한 건이 약 20초라 세 명만 겹쳐도 마지막 학생이 50초를 넘긴다. 그 요청은
+Backend가 규칙 기반 리포트로 대체한다. Backend가 50초에 포기한 요청을 AI 서버가 계속 생성하는지는
+확인하지 않았다(그렇다면 대기열이 더 빨리 밀린다). 시연에서는 수학
+추천을 여러 명이 동시에 누르지 않도록 진행하는 편이 안전하다.
+
+**측정으로 드러난 결함.** 처음 5명 혼합에서 영어·과학·사회 3건이 Qwen 대신 Ollama로 넘어갔다
+(`concept` 폴백 3건). 로그에 `Already borrowed`가 있었다 — HF 토크나이저(Rust)를 여러 스레드가
+동시에 부르면 실패한다. 생성은 `_GEN_LOCK`으로 막았지만 토크나이저 호출은 락 밖에 있었다. 순차
+42건에서는 0건이라 드러나지 않았다. `writing.py`는 같은 `base_model`·토크나이저를 쓰면서
+`set_adapter()`·`generate()`에도 락이 없었다. 그래서 `src/api/gen_lock.py`에 `GEN_LOCK`·
+`TOK_LOCK`을 두고 `main.py`와 `writing.py`가 함께 쓰게 했다. 고친 뒤 `Already borrowed`와
+폴백은 0건이다.
+
+**글쓰기 어댑터를 켜고 동시 요청.** `LOAD_WRITING_ADAPTER`를 임시로 켜고(측정 뒤 `False`로
+되돌림) `/api/writing/evaluate`를 동시에 보냈다.
+
+| 시나리오 | 전체 소요(초) | 결과 |
+|---|---|---|
+| evaluate 3건 | 29.4 | LLM 피드백·채점 3/3 |
+| evaluate 5건 | 48.1 | 5/5 |
+| evaluate 3건 + 수학 추천 3건 | 100.6 | evaluate 3/3, 추천 3/3(Qwen) |
+
+전부 200이고 오류·폴백 경고는 없었다. 어댑터가 덮였다면 오류 없이 답만 이상해졌을 텐데, 피드백
+문장을 하나씩 읽어 확인하지는 않았고 `llm_score`가 채워졌는지와 응답 길이만 봤다. `evaluate`는
+`async def` 안에서 생성을 스레드풀 없이 직접 돌려서(추정) 요청별 소요 시간이 시나리오 안에서 모두
+같게 찍혔다. 이 표에서 믿을 수 있는 것은 전체 소요 시간(한 건당 약 10초)뿐이다.
+
+**이 측정으로 알 수 없는 것.**
+- 42건은 작은 표본이라 "실패율 0%"가 아니라 "이 규모에서는 관찰되지 않았다"이다.
+- 순차 측정에서는 Ollama 대체 경로가 한 번도 실행되지 않았다. Qwen이 실패하면 Ollama가 최대
+  20초까지 붙는다.
+- in-process 호출이라 네트워크와 Backend 구간, 기동 직후(예열 전) 요청, 동시 5명을 넘는 부하는
+  재지 않았다.
 
 ### ConceptMap 확충 (13 → 42개 항목)
 
@@ -1714,15 +1811,17 @@ premium 학습 조언 문단" 절).
 - `/api/ai/report/math`, `/report/writing`, `/report/premium`의 LLM 문단은
   베이스 Qwen(`_qwen_advice`)을 먼저 쓰고, 미등록이거나 생성에 실패하면
   Ollama로 넘어갑니다(`counseling._advice`).
-- 개념 설명(`_concept_explain`)은 한국사와 생성 실패 시 여전히 Ollama로 넘어갑니다
-  — 한국사는 사실 정확도 때문에 그대로 둡니다(위 "한국사 개념 설명" 절).
+- 개념 설명(`_concept_explain`)은 생성 실패 시에만 Ollama로 넘어갑니다. 2026-09-29
+  한국사 삭제 전에는 한국사가 어댑터·FAISS 코퍼스가 없어 항상 이 경로를 탔지만,
+  한국사가 없어진 지금은 이 폴백이 정상적으로는 거의 일어나지 않습니다.
 - Backend의 `MathAiService`도 Ollama를 직접 호출합니다.
+- Qwen에서 Ollama로 넘어간 횟수는 `GET /api/ai/stats/fallback`에서 볼 수 있습니다(서버를
+  다시 띄우면 0으로 리셋). 실측은 위 "폴백 카운터와 부하 측정" 절 — 순차 42건에서는 0건이었습니다.
 
-**Ollama가 없어도 리포트는 나옵니다**(math/writing/premium은 Qwen이 대신 만듭니다).
-다만 한국사 개념 설명은 Ollama가 없으면 에러 없이 조용히 해당 섹션이 사라집니다
-(`_ollama_analyze`가 `None`을 반환하고 호출부가 생략). 한국사 리포트에 "AI 개념
-분석"이 안 보이면 Ollama부터 확인하세요. 한국사가 Ollama에 남아 있는 한 Ollama
-서버 자체를 없앨 수는 없습니다.
+**Ollama가 없어도 리포트는 나옵니다**(math/writing/premium은 Qwen이 대신 만듭니다,
+영어·과학·사회 개념 설명은 항상 Qwen이 만듭니다). math/writing/premium의 `_advice()`
+폴백이 남아 있는 한 Ollama 서버 자체를 없앨 수는 없습니다 — 한국사 삭제와는 무관한
+별개 경로입니다.
 
 ---
 
