@@ -27,18 +27,18 @@ DB의 기존 문서는 아래 형식이고, rag.py의 과목 필터(_SUBJECT_PAT
 사용법
 ------
     # 무엇이 들어갈지 먼저 보기
-    python scripts/ingest_rag_docs.py --from-concept-map 한국사 --dry-run
+    python scripts/ingest_rag_docs.py --from-concept-map 사회 --dry-run
 
-    # ConceptMap의 한국사 항목을 DB에 적재
-    python scripts/ingest_rag_docs.py --from-concept-map 한국사
+    # ConceptMap의 사회 항목을 DB에 적재
+    python scripts/ingest_rag_docs.py --from-concept-map 사회
 
     # 새로 들어온 문제/자료를 JSONL로 적재
-    #   {"subject": "한국사", "text": "...", "keywords": [...], "question": "...", "answer": "..."}
+    #   {"subject": "사회", "text": "...", "keywords": [...], "question": "...", "answer": "..."}
     #   (subject와 text만 필수)
     python scripts/ingest_rag_docs.py --from-jsonl data/new_docs.jsonl
 
-    # ConceptMap 항목을 고친 뒤 다시 적재 — 같은 출처(ConceptMap_한국사)의 옛 조각을 지우고 넣는다
-    python scripts/ingest_rag_docs.py --from-concept-map 한국사 --replace
+    # ConceptMap 항목을 고친 뒤 다시 적재 — 같은 출처(ConceptMap_사회)의 옛 조각을 지우고 넣는다
+    python scripts/ingest_rag_docs.py --from-concept-map 사회 --replace
 
     # 되돌리기: src/api/rag_db/ 의 .bak 파일을 원래 이름으로 되돌리면 된다.
     # 이미 있던 .bak은 지우지 않고 .bak.<수정일> 로 이름을 바꿔 둔다.
@@ -69,8 +69,8 @@ def build_doc(subject: str, text: str, keywords: list[str] | None = None,
               answer: str | None = None, source: str = "ingest") -> str:
     """DB의 기존 문서 형식에 맞춰 한 건을 조립한다.
 
-    [대상] 줄에 과목명이 들어가야 rag.py의 과목 필터가 잡는다. 예를 들어 한국사는
-    _SUBJECT_PATH_PATTERNS가 "한국사" 문자열을 찾는다.
+    [대상] 줄에 과목명이 들어가야 rag.py의 과목 필터가 잡는다. 예를 들어 사회는
+    _SUBJECT_PATH_PATTERNS가 "사회" 관련 문자열을 찾는다.
     """
     lines = [f"[대상]{subject} (폴더: {source}_{subject})"]
     meta = []

@@ -177,7 +177,6 @@ _SUBJECT_DEFAULT_CONCEPT: dict[str, str] = {
     "국어":   "문학과 비문학 독해",
     "과학":   "기본 과학 개념",
     "사회":   "사회 기본 개념",
-    "한국사": "한국사 주요 사건",
 }
 
 _SUBJECT_STRATEGY: dict[str, list[str]] = {
@@ -186,7 +185,6 @@ _SUBJECT_STRATEGY: dict[str, list[str]] = {
     "국어":   ["지문 구조 파악 훈련", "핵심 주장 및 근거 추출 연습", "어휘·표현 정리", "유사 지문 독해 연습"],
     "과학":   ["개념 원리 이해 및 정리", "관련 실험·현상 사례 확인", "공식·법칙 적용 연습", "단원 마무리 문제 풀이"],
     "사회":   ["핵심 개념·용어 정리", "관련 사례 및 사료 확인", "개념 간 연관성 파악", "기출 문제 풀이"],
-    "한국사": ["시대적 흐름 파악", "주요 사건·인물 정리", "사료 해석 연습", "연표 작성 후 복습"],
 }
 
 
@@ -254,7 +252,7 @@ def _concept_explain(subject: str, concept_query: str,
     elif subject in _LOADED_SUBJECT_ADAPTERS:
         adapter_name, _, system_prompt = SUBJECT_ADAPTERS[subject]
     else:
-        return None  # 한국사 등 어댑터 미보유 과목
+        return None  # 어댑터도 base 조건도 만족 못 하는 과목(현재는 해당 없음)
 
     try:
         model     = app.state.model

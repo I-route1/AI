@@ -15,7 +15,7 @@ app = FastAPI()
 app.include_router(counseling.router, prefix="/api/ai")
 client = TestClient(app)
 
-SUBJECTS = ["수학", "영어", "국어", "과학", "사회", "한국사"]
+SUBJECTS = ["수학", "영어", "국어", "과학", "사회"]
 TIERS = [("상위권", 90), ("중위권", 65), ("하위권", 35)]
 
 CONCEPT_BY_SUBJECT = {
@@ -24,7 +24,6 @@ CONCEPT_BY_SUBJECT = {
     "국어":   "비문학 지문 구조",
     "과학":   "뉴턴 운동 법칙",
     "사회":   "수요와 공급",
-    "한국사": "조선 후기 실학",
 }
 
 ENDPOINT_BY_SUBJECT = {

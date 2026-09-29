@@ -259,12 +259,6 @@ def main():
             passages = json.load(f)
         print(f"RAG 지문 {len(passages)}개 개념 로드 — 학습 형식 프롬프트로 평가합니다.\n")
 
-    # 한국사는 어댑터가 없어 어댑터 vs 베이스 비교 대상이 아니다.
-    if "한국사" in args.subjects:
-        print("한국사는 어댑터가 없어 이 평가 대상이 아닙니다. "
-              "test_korean_history_explain_eval.py를 쓰세요.\n")
-        args.subjects = [s for s in args.subjects if s != "한국사"]
-
     all_entries = [v for v in _CONCEPT_MAP.values()]
     df = build_df(all_entries)
     n_docs = len(all_entries)

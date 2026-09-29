@@ -16,7 +16,6 @@ MATH_SYSTEM_PROMPT = "당신은 수학 전문 교사입니다. 학생의 수학 
 # 과목 -> (어댑터 이름, 경로, system 프롬프트)
 # system 프롬프트는 train/preprocess_curriculum.py의 SUBJECTS와 글자 단위로 동일해야 한다.
 # 학습 때 쓴 문구와 다르면 파인튜닝 효과가 떨어진다.
-# 한국사는 AI-Hub 교육과정 데이터에 해당 과목이 없어 어댑터가 없다(Ollama fallback).
 SUBJECT_ADAPTERS: dict[str, tuple[str, str, str]] = {
     "국어": ("korean",  "train/korean_adapter_qwen",
              "당신은 국어 전문 교사입니다. 학생의 국어 지문과 질문에 대해 정확하고 이해하기 쉬운 답변을 제공하세요."),

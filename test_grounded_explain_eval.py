@@ -1,24 +1,20 @@
 """개념 설명 사실 정확도 점검 — 서빙과 같은 경로로 생성해 사람이 읽고 판정한다.
 
 개념F1(test_concept_explain_eval.py)은 참조 용어가 출력에 나오는지만 봐서 사실 오류를
-잡지 못한다(한국사에서 개념F1은 Qwen이 앞섰지만 사실 정확도는 Ollama가 나았다). 그래서
-이 스크립트는 점수를 매기지 않는다. 서빙 함수·설정 그대로 생성해 저장하고, 이전 실행과
-비교해 **달라진 출력만** 보여 준다. 판정 기록(eval/fact_judgments.json)이 있으면 옆에 띄운다.
+잡지 못한다. 그래서 이 스크립트는 점수를 매기지 않는다. 서빙 함수·설정 그대로 생성해
+저장하고, 이전 실행과 비교해 **달라진 출력만** 보여 준다. 판정 기록(eval/fact_judgments.json)이
+있으면 옆에 띄운다.
 
 ConceptMap을 고친 뒤에는 이걸로 퇴행을 확인한다. 실제로 영어 항목의 자료가 둘에서 하나로
 줄자 "what 앞에 선행사가 온다"로 부정이 뒤집힌 적이 있다.
 
 개념 목록
 - backend: Backend 시드(questions_seed.json)의 실제 conceptTag 42개
-- history: 한국사 핵심어 20개 (ConceptMap 키워드로 찾는 경로)
-- history_faiss: 키워드에 안 걸려 FAISS로 넘어가는 한국사 질의 12개
 - extra: 보강하며 다룬 영어·국어 개념
 
-생성: 한국사는 Ollama(subject-recommend 폴백 프롬프트), 나머지는 베이스 Qwen
-(_concept_explain과 같은 프롬프트·후처리·문자 차단·길이 한도). 재현을 위해 Qwen은 greedy,
-Ollama는 temperature 0·seed 고정이다. 그래도 Ollama는 실행마다 조금 달라질 수 있다.
+생성: 베이스 Qwen(_concept_explain과 같은 프롬프트·후처리·문자 차단·길이 한도). 재현을 위해
+greedy로 생성한다.
 
-FAISS(69만 벡터)와 8B 모델을 한 프로세스에 올리지 않도록 두 단계로 나눈다.
     python test_grounded_explain_eval.py retrieve train/fact_ctx.json
     python test_grounded_explain_eval.py generate train/fact_ctx.json train/fact_out.json
     # 기준 출력(eval/fact_out_20260929.json, 판정 77.5/79)과 비교 — 달라진 것만 판정하면 된다
@@ -49,13 +45,6 @@ CONCEPTS: dict[str, list[tuple[str, str]]] = {
         "과학": ["뉴턴 운동 법칙", "물질 변화", "세포 구조", "유전과 진화"],
         "사회": ["민주주의 원리", "세계 지리", "시장 경제", "한국 현대사"],
     }.items() for c in cs],
-    "history": [("한국사", c) for c in [
-        "신간회", "병자호란", "서희", "대동법", "균역법", "을사늑약", "6월 민주항쟁", "4.19혁명",
-        "갑오개혁", "광주학생항일운동", "탕평책", "삼별초", "직지심체요절", "훈민정음", "서원 철폐",
-        "청산리", "물산장려운동", "과전법", "광개토대왕", "헤이그특사"]],
-    "history_faiss": [("한국사", c) for c in [
-        "군신 관계", "청 태종의 침입", "명성황후 시해", "강화도 천도", "천리장성 축조", "노비안검법",
-        "호패법 실시", "훈련도감 설치", "국채 갚기 운동", "남북 정상회담", "금융실명제", "무신 집권기"]],
     "extra": [("영어", "관계대명사 what"), ("영어", "to부정사 의미상 주어"),
               ("국어", "음운 변동"), ("국어", "사이시옷"), ("국어", "동사와 형용사 구별")],
 }
@@ -76,14 +65,13 @@ def retrieve(out_path: str) -> None:
 
 
 def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
-    import httpx
     import torch
     from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
                               LogitsProcessorList)
 
     from src.api.adapters import BASE_MODEL_ID, MATH_SYSTEM_PROMPT, SUBJECT_ADAPTERS
-    from src.api.generation import CONCEPT_GEN_GREEDY, OLLAMA_MODEL, OLLAMA_OPTIONS, OLLAMA_URL
-    from src.api.grounding import concept_user_message, context_block
+    from src.api.generation import CONCEPT_GEN_GREEDY
+    from src.api.grounding import concept_user_message
     from src.api.postprocess import strip_markdown, trim_cut_tail
     from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
                                       latin_token_mask, strip_foreign)
@@ -97,16 +85,15 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
     if only:  # 쉼표로 구분한 개념 이름 — 항목 하나를 고친 뒤 그 개념만 다시 볼 때
         wanted = set(only.split(","))
         rows = [r for r in rows if r["concept"] in wanted]
-    tok = model = blocker = latin_blocker = None
-    if any(r["subject"] != "한국사" for r in rows):
-        tok = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
-        model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_ID, device_map={"": 0},
-            quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                                   bnb_4bit_compute_dtype=torch.bfloat16,
-                                                   bnb_4bit_use_double_quant=True)).eval()
-        blocker = ForeignScriptBlocker(foreign_token_mask(tok, model.config.vocab_size))
-        latin_blocker = ForeignScriptBlocker(latin_token_mask(tok, model.config.vocab_size))
+
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_ID, device_map={"": 0},
+        quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                               bnb_4bit_compute_dtype=torch.bfloat16,
+                                               bnb_4bit_use_double_quant=True)).eval()
+    blocker = ForeignScriptBlocker(foreign_token_mask(tok, model.config.vocab_size))
+    latin_blocker = ForeignScriptBlocker(latin_token_mask(tok, model.config.vocab_size))
 
     def qwen(subject: str, concept: str, docs: list[str]) -> tuple[str, int, bool]:
         sysp = MATH_SYSTEM_PROMPT if subject == "수학" else SUBJECT_ADAPTERS[subject][2]
@@ -126,24 +113,10 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
         leaked = has_foreign(text)
         return (strip_foreign(text).strip() if leaked else text.strip()), n, leaked
 
-    def ollama(concept: str, docs: list[str]) -> tuple[str, int, bool]:
-        prompt = (f"{context_block(docs)}한국사 과목에서 '{concept}' 개념을 어려워하는 학생에게 "
-                  f"이 개념의 핵심 포인트와 효과적인 학습 방법을 2~3문장으로 한국어로 답해주세요.")
-        opts = {**OLLAMA_OPTIONS, "temperature": 0.0, "seed": 42}
-        r = httpx.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-                                         "options": opts}, timeout=120).json()
-        text = r.get("response", "").strip()
-        leaked = has_foreign(text)
-        return (strip_foreign(text).strip() if leaked else text), r.get("eval_count", 0), leaked
-
     for i, row in enumerate(rows):
         s, c = row["subject"], row["concept"]
-        if s == "한국사":
-            row["out"], row["tokens"], row["leaked"] = ollama(c, row["docs"])
-            row["limit"] = OLLAMA_OPTIONS["num_predict"]
-        else:
-            row["out"], row["tokens"], row["leaked"] = qwen(s, c, row["docs"])
-            row["limit"] = CONCEPT_GEN_GREEDY["max_new_tokens"]
+        row["out"], row["tokens"], row["leaked"] = qwen(s, c, row["docs"])
+        row["limit"] = CONCEPT_GEN_GREEDY["max_new_tokens"]
         print(f"[{i + 1}/{len(rows)}] {s} {c} ({row['tokens']}토큰)", flush=True)
         json.dump(rows, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 

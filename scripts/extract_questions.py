@@ -14,7 +14,6 @@ SUBJECT_MAP = {
     '과학': 4,
     '사회': 5,
     '사회문화': 5,
-    '한국사': 5,
 }
 
 def grade_to_difficulty(target: str) -> int:
