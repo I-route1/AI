@@ -166,8 +166,9 @@ def _script_blockers(subject: str | None) -> "LogitsProcessorList":
     return LogitsProcessorList(processors)
 
 
-# GPU 생성은 한 번에 하나씩 (_concept_explain 참고).
-_GEN_LOCK = threading.Lock()
+# GPU 생성·토크나이저 락은 writing.py와 같은 base_model/tokenizer를 공유하므로
+# src.api.gen_lock에 있다 (자세한 이유는 그 파일 참고).
+from src.api.gen_lock import GEN_LOCK as _GEN_LOCK, TOK_LOCK as _TOK_LOCK
 
 
 _SUBJECT_DEFAULT_CONCEPT: dict[str, str] = {
@@ -268,7 +269,8 @@ def _concept_explain(subject: str, concept_query: str,
         )
         # 참고 자료가 붙으면 입력이 1,000토큰을 넘을 수 있다. 오른쪽부터 잘리므로
         # 한도가 모자라면 질문과 생성 프롬프트가 먼저 날아간다.
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to("cuda")
+        with _TOK_LOCK:
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to("cuda")
         input_len = inputs["input_ids"].shape[-1]
 
         def _gen():
@@ -291,7 +293,8 @@ def _concept_explain(subject: str, concept_query: str,
                 model.set_adapter(adapter_name)
                 outputs = _gen()
 
-        text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        with _TOK_LOCK:
+            text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
         text = strip_markdown(text)
         if outputs.shape[-1] - input_len >= CONCEPT_GEN["max_new_tokens"]:
             text = trim_cut_tail(text)
@@ -340,7 +343,8 @@ def _qwen_advice(prompt: str, subject: str | None = None) -> str | None:
         chat = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
-        inputs = tokenizer(chat, return_tensors="pt", truncation=True, max_length=1024).to("cuda")
+        with _TOK_LOCK:
+            inputs = tokenizer(chat, return_tensors="pt", truncation=True, max_length=1024).to("cuda")
         input_len = inputs["input_ids"].shape[-1]
 
         def _gen():
@@ -355,7 +359,8 @@ def _qwen_advice(prompt: str, subject: str | None = None) -> str | None:
         with _GEN_LOCK, base_model.disable_adapter():
             outputs = _gen()
 
-        text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        with _TOK_LOCK:
+            text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
         text = strip_markdown(text)
         if outputs.shape[-1] - input_len >= ADVICE_GEN["max_new_tokens"]:
             text = trim_cut_tail(text)

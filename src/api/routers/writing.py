@@ -6,6 +6,8 @@ from typing import List, Optional
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
+from src.api.gen_lock import GEN_LOCK, TOK_LOCK
+
 router = APIRouter()
 
 # ──────────────── Schemas ────────────────
@@ -202,7 +204,6 @@ def _llm_feedback(request: Request, question: str, model_answer: str,
         return None, None
     try:
         tokenizer = request.app.state.writing_tokenizer
-        model.set_adapter("writing")
 
         missing_hint = f"\n누락된 키워드: {', '.join(missing[:3])}" if missing else ""
         messages = [
@@ -225,18 +226,23 @@ def _llm_feedback(request: Request, question: str, model_answer: str,
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
 
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=896).to("cuda")
+        with TOK_LOCK:
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=896).to("cuda")
         input_len = inputs["input_ids"].shape[-1]
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=150,
-                temperature=0.4,
-                do_sample=True,
-                repetition_penalty=1.3,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        feedback = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        # set_adapter()는 model 하나의 상태를 바꾸므로 main.py의 생성과 같은 락으로 묶는다.
+        with GEN_LOCK:
+            model.set_adapter("writing")
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=150,
+                    temperature=0.4,
+                    do_sample=True,
+                    repetition_penalty=1.3,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+        with TOK_LOCK:
+            feedback = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
         # 혹시 남아있을 수 있는 사고 블록 제거 (enable_thinking=False로 대부분 방지되지만 방어적으로)
         feedback = re.sub(r'<think>.*?</think>', '', feedback, flags=re.DOTALL).strip()
         # 마크다운 헤더 제거
@@ -288,7 +294,6 @@ def _llm_grade(request: Request, question: str, user_answer: str) -> tuple[Optio
         return None, None
     try:
         tokenizer = request.app.state.writing_tokenizer
-        model.set_adapter("writing")
 
         messages = [
             {"role": "system",
@@ -299,11 +304,16 @@ def _llm_grade(request: Request, question: str, user_answer: str) -> tuple[Optio
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=896).to("cuda")
-        with torch.no_grad():
-            logits = model(**inputs).logits[0, -1, :].float()
+        with TOK_LOCK:
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=896).to("cuda")
+        # set_adapter()는 model 하나의 상태를 바꾸므로 main.py의 생성과 같은 락으로 묶는다.
+        with GEN_LOCK:
+            model.set_adapter("writing")
+            with torch.no_grad():
+                logits = model(**inputs).logits[0, -1, :].float()
 
-        ids = [tokenizer.encode(str(c), add_special_tokens=False) for c in _GRADE_SCALE]
+        with TOK_LOCK:
+            ids = [tokenizer.encode(str(c), add_special_tokens=False) for c in _GRADE_SCALE]
         if any(len(i) != 1 for i in ids):
             return None, None
         vec = torch.tensor([logits[i[0]] for i in ids])
