@@ -2,7 +2,7 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from src.api import model_registry
+from src.api import fallback_stats, model_registry
 from src.api.concept_map import search_concept_map
 from src.api.generation import OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_OPTIONS, OLLAMA_URL
 from src.api.java_client import get_student_weakness_from_java
@@ -90,8 +90,11 @@ async def _advice(prompt: str, subject: str | None = None) -> str | None:
     if qwen_advice:
         result = await run_in_threadpool(qwen_advice, prompt, subject)
         if result:
+            fallback_stats.record("advice", "qwen")
             return result
-    return await _ollama_analyze(prompt)
+    result = await _ollama_analyze(prompt)
+    fallback_stats.record("advice", "ollama" if result else "none")
+    return result
 
 
 def _level_label(percentile: float) -> str:
@@ -503,8 +506,10 @@ async def report_subject(subject: str, req: dict):
         concept_explain = model_registry.get("concept_explain")
         if concept_explain:
             llm_insight = await run_in_threadpool(concept_explain, subject, concept, rag_docs)
+            if llm_insight:
+                fallback_stats.record("concept", "qwen")
 
-        # 2순위: _concept_explain()이 None을 준 경우(한국사, 생성 실패) Ollama
+        # 2순위: _concept_explain()이 None을 준 경우(생성 실패) Ollama
         if not llm_insight:
             prompt = (
                 f"{context_block(rag_docs)}"
@@ -513,6 +518,7 @@ async def report_subject(subject: str, req: dict):
                 f"그것을 극복하는 구체적인 학습 전략을 2~3문장으로 간결하게 한국어로 답해주세요."
             )
             llm_insight = await _ollama_analyze(prompt)
+            fallback_stats.record("concept", "ollama" if llm_insight else "none")
 
         if llm_insight:
             result["careerAnalysis"] += f"\n\n[AI 개념 심층 분석]\n{llm_insight}"

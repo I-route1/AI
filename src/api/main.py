@@ -30,7 +30,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 
-from src.api import model_registry
+from src.api import fallback_stats, model_registry
 from src.api.adapters import (
     BASE_MODEL_ID, MATH_ADAPTER_PATH, WRITING_ADAPTER_PATH,
     MATH_SYSTEM_PROMPT, SUBJECT_ADAPTERS,
@@ -435,6 +435,8 @@ async def generate_subject_recommendation(
     # 베이스 Qwen으로 생성하고, _concept_explain()이 None을 주는 과목만 Ollama로 넘긴다.
     # GPU 생성은 수 초가 걸리는 블로킹 작업이라 threadpool로 빼서 이벤트 루프를 막지 않는다.
     llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query, rag_docs)
+    if llm_insight:
+        fallback_stats.record("concept", "qwen")
 
     if not llm_insight:
         prompt = (
@@ -443,6 +445,7 @@ async def generate_subject_recommendation(
             f"이 개념의 핵심 포인트와 효과적인 학습 방법을 2~3문장으로 한국어로 답해주세요."
         )
         llm_insight = await _ollama_analyze(prompt)
+        fallback_stats.record("concept", "ollama" if llm_insight else "none")
 
     if llm_insight:
         report += f"\n\n[AI 개념 분석]\n{llm_insight}"
@@ -453,6 +456,12 @@ async def generate_subject_recommendation(
         "targetConcept": concept_query,
         "aiRecommendationReport": report,
     }
+
+
+@app.get("/api/ai/stats/fallback")
+async def fallback_counts():
+    """Qwen 실패 → Ollama/규칙 기반 폴백 누적 횟수(서버 재기동 시 0으로 리셋)."""
+    return fallback_stats.snapshot()
 
 
 # ── 라우터 등록 (반드시 위의 @app 경로들을 모두 정의한 뒤) ──────────────────────
