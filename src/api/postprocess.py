@@ -127,6 +127,8 @@ def strip_markdown(text: str) -> str:
 # 앞뒤 인사말은 학생에게 엉뚱하게 읽힌다(배포 QA 33개 중 "물론입니다!" 10개,
 # "필요하다면 … 알려드릴 수 있어요" 8개).
 _OPENER = re.compile(r"^(?:물론입니다|물론이죠|물론이에요|좋습니다|좋아요|네)\s*[!.,]\s*")
+# "학생 여러분," 같은 부름말로 시작하기도 한다(재생성 QA, "연속 지문 흐름 찾기").
+_GREETING = re.compile(r"^(?:(?:학생\s*)?여러분|안녕하세요)(?:\s*,?\s*안녕하세요)?\s*[!.,~]\s*")
 # 첫 줄 끝의 안내 문장: "…핵심 포인트는 다음과 같습니다:", "아래는 …을 설명한 내용입니다."
 # 내용 문장("이 구조는 다음과 같은 형식을 따릅니다:")을 지우지 않도록 '핵심·설명·정리'
 # 같은 말이 같이 있어야 안내 문장으로 본다.
@@ -144,7 +146,7 @@ def strip_chat_frame(text: str) -> str:
     strip_markdown() 뒤에 부른다(줄 단위로 정리된 텍스트를 가정). 남는 게 없으면 원문을 돌려준다.
     """
     original = text
-    text = _OPENER.sub("", text.lstrip())
+    text = _OPENER.sub("", _GREETING.sub("", text.lstrip())).lstrip()
     lines = text.split("\n")
     first = lines[0].rstrip()
     if first.endswith((":", "：", ".")):
