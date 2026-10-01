@@ -40,7 +40,7 @@ from src.api.routers.counseling import _ollama_analyze
 from src.api.generation import ADVICE_GEN, CONCEPT_GEN
 from src.api.postprocess import strip_chat_frame, strip_markdown, trim_cut_tail
 from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
-                                  latin_token_mask, strip_foreign)
+                                  latin_token_mask, strip_foreign, RareHangulBlocker)
 from transformers import LogitsProcessorList
 from src.api.routers.rag import subject_aware_search as _subject_aware_search
 from src.api.java_client import get_student_weakness_from_java
@@ -158,9 +158,12 @@ _FOREIGN_BLOCKER = ForeignScriptBlocker(foreign_token_mask(tokenizer, base_model
 _LATIN_BLOCKER = ForeignScriptBlocker(latin_token_mask(tokenizer, base_model.config.vocab_size))
 _NO_LATIN_SUBJECTS = frozenset({"국어", "사회"})
 
+# 샘플링에서 "귥한", "줿게" 같은 깨진 한글 음절이 나와 전 과목에서 막는다(script_guard 설명 참고).
+_RARE_HANGUL_BLOCKER = RareHangulBlocker(tokenizer, base_model.config.vocab_size)
+
 
 def _script_blockers(subject: str | None) -> "LogitsProcessorList":
-    processors = [_FOREIGN_BLOCKER]
+    processors = [_FOREIGN_BLOCKER, _RARE_HANGUL_BLOCKER]
     if subject in _NO_LATIN_SUBJECTS:
         processors.append(_LATIN_BLOCKER)
     return LogitsProcessorList(processors)

@@ -74,7 +74,8 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
     from src.api.grounding import concept_user_message
     from src.api.postprocess import strip_chat_frame, strip_markdown, trim_cut_tail
     from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
-                                      latin_token_mask, strip_foreign)
+                                      latin_token_mask, strip_foreign,
+                                      RareHangulBlocker)
 
     # 국어·사회는 개념 설명에 영어가 나올 이유가 없어 영문자 토큰도 막는다(main._NO_LATIN_SUBJECTS
     # 와 같은 목록) — 실제로 "갈Conflict", "속belongs합니다" 같은 섞임이 있었다. 이 목록이
@@ -94,6 +95,7 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
                                                bnb_4bit_use_double_quant=True)).eval()
     blocker = ForeignScriptBlocker(foreign_token_mask(tok, model.config.vocab_size))
     latin_blocker = ForeignScriptBlocker(latin_token_mask(tok, model.config.vocab_size))
+    rare_blocker = RareHangulBlocker(tok, model.config.vocab_size)
 
     def qwen(subject: str, concept: str, docs: list[str]) -> tuple[str, int, bool]:
         sysp = MATH_SYSTEM_PROMPT if subject == "수학" else SUBJECT_ADAPTERS[subject][2]
@@ -102,7 +104,7 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
         ids = tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                           enable_thinking=False),
                   return_tensors="pt", truncation=True, max_length=2048).to("cuda")
-        processors = [blocker] + ([latin_blocker] if subject in _NO_LATIN_SUBJECTS else [])
+        processors = [blocker, rare_blocker] + ([latin_blocker] if subject in _NO_LATIN_SUBJECTS else [])
         with torch.no_grad():
             out = model.generate(**ids, **CONCEPT_GEN_GREEDY, pad_token_id=tok.eos_token_id,
                                  logits_processor=LogitsProcessorList(processors))

@@ -12,6 +12,7 @@
 괄호 안의 한자 병기("반어(反語)", "훈민정음(訓民正音)")는 정상 표기라 섞임으로 보지 않는다.
 """
 import re
+from pathlib import Path
 
 import torch
 from transformers import LogitsProcessor
@@ -85,3 +86,92 @@ class ForeignScriptBlocker(LogitsProcessor):
         if self.mask.device != scores.device:
             self.mask = self.mask.to(scores.device)
         return scores.masked_fill(self.mask[: scores.shape[-1]], float("-inf"))
+
+
+# ── 드문 한글 음절 ──────────────────────────────────────────────────────────
+# 샘플링 생성에서 "귥한"(극한), "줿게" 같은 깨진 음절이 나왔다(재생성 88개 중 2개, greedy 79개 중 0개).
+# 이 음절들은 단일 토큰이 아니라 바이트 조각 두 개로 만들어진다 — "귥" = [89061, 98]. 89061은
+# U+ADC0~ADFF 앞 두 바이트라 "극"도 같은 조각에서 시작한다. 반복 벌점(1.2)이 이미 많이 쓴 "극"
+# 토큰을 깎으면 모델이 이 바이트 경로로 돌아가고, 마지막 바이트에서 엉뚱한 음절이 완성된다.
+#
+# 그래서 토큰 하나를 보는 마스크(위 foreign_token_mask)로는 못 막고, 앞에서 만들다 만 바이트가
+# 있으면 그걸 완성하는 다음 토큰 중 "교과 문서 70만 개에 한 번도 안 나온 음절"이 되는 것만 막는다.
+# 같은 조각에서 "극"을 완성하는 길은 열려 있다. 목록은 scripts/build_hangul_seen.py가 만든다.
+# 기준을 "한 번도 안 나옴"으로 잡아 숱·삯·짊 같은 드물지만 실제로 쓰는 음절은 막지 않는다.
+_SEEN_HANGUL_PATH = Path(__file__).with_name("hangul_seen.txt")
+
+
+def _is_rare_hangul(ch: str, seen: frozenset[str]) -> bool:
+    return "가" <= ch <= "힣" and ch not in seen
+
+
+def _token_bytes(tokenizer, vocab_size: int) -> list[bytes | None]:
+    """토큰 id → 바이트열. Qwen은 GPT-2식 바이트 수준 BPE라 토큰 문자열을 바이트로 되돌릴 수 있다.
+    특수·추가 토큰처럼 되돌릴 수 없는 것은 None."""
+    # GPT-2 bytes_to_unicode()와 같은 표. 지금 쓰는 transformers 버전에는 그 함수가 없다.
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    dec = {chr(c): b for b, c in zip(bs, cs)}
+    # len(tokenizer)는 fast 토크나이저에서 부를 때마다 어휘를 새로 세므로 한 번만 부른다
+    strs = tokenizer.convert_ids_to_tokens(list(range(min(len(tokenizer), vocab_size))))
+    out: list[bytes | None] = [
+        bytes(dec[c] for c in s) if s and all(c in dec for c in s) else None for s in strs
+    ]
+    return out + [None] * (vocab_size - len(out))
+
+
+def _pending_prefix(data: bytes) -> bytes:
+    """끝에 남은, 아직 완성되지 않은 한글 음절(3바이트, 첫 바이트 EA~ED)의 앞부분."""
+    for k in (2, 1):
+        tail = data[-k:]
+        if len(tail) == k and 0xEA <= tail[0] <= 0xED and all(0x80 <= b <= 0xBF for b in tail[1:]):
+            return tail
+    return b""
+
+
+class RareHangulBlocker(LogitsProcessor):
+    """드문 한글 음절이 완성되지 못하게 한다. 단일 토큰으로 들어 있는 것은 늘 막고, 바이트 조각으로
+    만들다 만 음절은 그걸 완성하는 다음 토큰만 막는다(위 설명)."""
+
+    def __init__(self, tokenizer, vocab_size: int, seen_path: Path = _SEEN_HANGUL_PATH):
+        self.seen = frozenset(seen_path.read_text(encoding="utf-8").strip())
+        self.tok_bytes = _token_bytes(tokenizer, vocab_size)
+        self.always = torch.zeros(vocab_size, dtype=torch.bool)
+        self.cont: list[tuple[int, bytes]] = []  # 연속 바이트(0x80~0xBF)로 시작하는 토큰
+        for i, b in enumerate(self.tok_bytes):
+            if not b:
+                continue
+            if any(_is_rare_hangul(ch, self.seen) for ch in b.decode("utf-8", errors="ignore")):
+                self.always[i] = True
+            if 0x80 <= b[0] <= 0xBF:
+                self.cont.append((i, b))
+        self._by_prefix: dict[bytes, torch.Tensor] = {}
+
+    def _prefix_mask(self, prefix: bytes) -> torch.Tensor:
+        if prefix not in self._by_prefix:
+            need = 3 - len(prefix)
+            mask = self.always.clone()
+            for i, b in self.cont:
+                if len(b) >= need:
+                    ch = (prefix + b[:need]).decode("utf-8", errors="ignore")
+                    if len(ch) == 1 and _is_rare_hangul(ch, self.seen):
+                        mask[i] = True
+            self._by_prefix[prefix] = mask
+        return self._by_prefix[prefix]
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if self.always.device != scores.device:
+            self.always = self.always.to(scores.device)
+            self._by_prefix = {}
+        for row in range(scores.shape[0]):
+            tail = b"".join(self.tok_bytes[t] or b"" for t in input_ids[row, -3:].tolist())
+            prefix = _pending_prefix(tail)
+            mask = self._prefix_mask(prefix).to(scores.device) if prefix else self.always
+            scores[row] = scores[row].masked_fill(mask[: scores.shape[-1]], float("-inf"))
+        return scores
