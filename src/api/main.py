@@ -38,7 +38,7 @@ from src.api.adapters import (
 from src.api.routers import counseling, predictor, writing, rag
 from src.api.routers.counseling import _ollama_analyze
 from src.api.generation import ADVICE_GEN, CONCEPT_GEN
-from src.api.postprocess import strip_markdown, trim_cut_tail
+from src.api.postprocess import strip_chat_frame, strip_markdown, trim_cut_tail
 from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
                                   latin_token_mask, strip_foreign)
 from transformers import LogitsProcessorList
@@ -296,6 +296,7 @@ def _concept_explain(subject: str, concept_query: str,
         text = strip_markdown(text)
         if outputs.shape[-1] - input_len >= CONCEPT_GEN["max_new_tokens"]:
             text = trim_cut_tail(text)
+        text = strip_chat_frame(text)
         # 바이트 단위로 쪼개진 드문 한자는 토큰 마스크로 못 막는다. 남으면 지운다.
         if has_foreign(text):
             text = strip_foreign(text).strip()

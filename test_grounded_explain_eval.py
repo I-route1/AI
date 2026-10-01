@@ -72,7 +72,7 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
     from src.api.adapters import BASE_MODEL_ID, MATH_SYSTEM_PROMPT, SUBJECT_ADAPTERS
     from src.api.generation import CONCEPT_GEN_GREEDY
     from src.api.grounding import concept_user_message
-    from src.api.postprocess import strip_markdown, trim_cut_tail
+    from src.api.postprocess import strip_chat_frame, strip_markdown, trim_cut_tail
     from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
                                       latin_token_mask, strip_foreign)
 
@@ -110,6 +110,7 @@ def generate(ctx_path: str, out_path: str, only: str | None = None) -> None:
         text = strip_markdown(tok.decode(out[0][ids["input_ids"].shape[-1]:], skip_special_tokens=True))
         if n >= CONCEPT_GEN_GREEDY["max_new_tokens"]:
             text = trim_cut_tail(text)
+        text = strip_chat_frame(text)
         leaked = has_foreign(text)
         return (strip_foreign(text).strip() if leaked else text.strip()), n, leaked
 
