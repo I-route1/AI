@@ -1763,8 +1763,14 @@ Backend가 규칙 기반 리포트로 대체한다. Backend가 50초에 포기�
   이전 출력에도 같은 수준의 실수가 있었다(가정법 예문의 "시험을 끝낼 수 있었을" 등 — 당시 ✓로 판정).
   개념당 출력 하나라 이 2점 차이가 실제 품질 차이인지는 이 평가로 가릴 수 없다. 나머지 42개는 같거나
   화살표만 되살아났다(7개). 기준 출력은 `eval/fact_out_20261003.json`, 판정은 `eval/fact_judgments.json`.
-- 남은 것: `/api/rag/search`는 과목 구분 없이 벡터 검색만 해 "미적분의 기본정리"에 초등 분수 문서가
-  나온다(Backend `MathAiService`, Front `aiReport.js`가 호출). 응답 형식을 유지하며 고쳐야 해 보류.
+- `/api/rag/search`는 과목 구분 없이 벡터 검색만 해 "미적분의 기본정리"에 초등 분수 문서가 나왔다.
+  응답 형식 `{context}`는 그대로 두고 `/api/ai/search`처럼 과목(요청의 subject 또는 감지)이 있으면
+  `subject_aware_search`로 찾게 했다. 과목 감지(`rag.detect_subject`, counseling에서 옮김)는 ConceptMap
+  키워드에 걸리는 과목을 먼저 본다 — "관계대명사 what"이 과목 키워드에 안 걸려 초등 영어 문서로
+  떨어졌다. 질문 8개 중 7개가 맞는 ConceptMap 항목을 첫 결과로 받고, "행렬의 곱셈 조건"은 명제
+  항목('조건')이 먼저, 행렬이 둘째다(같은 길이 키워드는 사전 순서). 호출부(Backend `MathAiService`,
+  Front `aiReport.ragSearch`)는 지금 어디서도 쓰이지 않는다. 남은 흠: 과목 키워드가 부분 문자열이라
+  "시간이 부족해요"가 '시' 때문에 국어로 잡힌다.
   `irt/estimate`는 점수가 0~100 척도다(점검 때 1~4를 넣어 θ=-3이 나온 건 입력 실수).
 
 ### ConceptMap 확충 (13 → 42개 항목)

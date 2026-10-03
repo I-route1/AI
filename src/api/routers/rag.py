@@ -344,9 +344,30 @@ def subject_aware_search(subject: str, query: str, k: int = 3) -> list[str]:
 
 
 # ── POST /api/rag/search ───────────────────────────────────────────────────────
+def detect_subject(query: str) -> str | None:
+    """쿼리에서 과목을 자동 감지. 매칭 없으면 None.
+
+    ConceptMap 키워드에 걸리는 과목을 먼저 본다 — "관계대명사 what"처럼 과목 이름이 없는 질문이
+    아래 과목 키워드 목록에는 안 걸려 과목 필터 없는 벡터 검색(초등 영어 문서)으로 떨어졌다.
+    """
+    for subject in _SUBJECT_KEYWORDS:
+        if _concept_map_search(subject, query, 1):
+            return subject
+    for subject, keywords in _SUBJECT_KEYWORDS.items():
+        if any(kw in query for kw in keywords):
+            return subject
+    return None
+
+
 @router.post("/search")
 async def rag_search(req: dict):
+    """질문으로 참고 자료를 찾아 하나의 문자열로 돌려준다. 응답 형식 {context}는 그대로다.
+
+    예전에는 과목 구분 없이 vector_search만 해서 "미적분의 기본정리"에 초등 3학년 분수 문서가
+    나왔다(2026-10-03 점검). /api/ai/search와 같이 과목(요청의 subject 또는 질문에서 감지)이
+    있으면 ConceptMap → 그 과목 FAISS 순으로 찾는다.
+    """
     query = req.get("question", "")
-    results = vector_search(query, k=3)
-    context = "\n\n".join(results)
-    return {"context": context}
+    subject = req.get("subject") or detect_subject(query)
+    results = subject_aware_search(subject, query, k=3) if subject else vector_search(query, k=3)
+    return {"context": "\n\n".join(results)}

@@ -9,7 +9,7 @@ from src.api.java_client import get_student_weakness_from_java
 from src.api.grounding import context_block, is_curated
 from src.api.postprocess import strip_markdown
 from src.api.script_guard import has_foreign, strip_foreign
-from src.api.routers.rag import subject_aware_search, vector_search, _SUBJECT_KEYWORDS
+from src.api.routers.rag import detect_subject, subject_aware_search, vector_search, _SUBJECT_KEYWORDS
 
 router = APIRouter()
 
@@ -522,18 +522,10 @@ async def report_subject(subject: str, req: dict):
     return result
 
 
-def _detect_subject(query: str) -> str | None:
-    """쿼리에서 과목을 자동 감지. 매칭 없으면 None."""
-    for subject, keywords in _SUBJECT_KEYWORDS.items():
-        if any(kw in query for kw in keywords):
-            return subject
-    return None
-
-
 @router.post("/search")
 async def ai_search(req: dict):
     query = req.get("question", "")
-    subject = req.get("subject") or _detect_subject(query)
+    subject = req.get("subject") or detect_subject(query)
     if subject:
         contexts = subject_aware_search(subject, query, k=5)
     else:
