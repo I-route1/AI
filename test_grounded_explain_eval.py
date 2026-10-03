@@ -17,8 +17,8 @@ greedy로 생성한다.
 
     python test_grounded_explain_eval.py retrieve train/fact_ctx.json
     python test_grounded_explain_eval.py generate train/fact_ctx.json train/fact_out.json
-    # 기준 출력(eval/fact_out_20260929.json, 판정 77.5/79)과 비교 — 달라진 것만 판정하면 된다
-    python test_grounded_explain_eval.py compare  eval/fact_out_20260929.json train/fact_out.json
+    # 기준 출력(eval/fact_out_20261003.json, 판정 44/47)과 비교 — 달라진 것만 판정하면 된다
+    python test_grounded_explain_eval.py compare  eval/fact_out_20261003.json train/fact_out.json
     # 일부 개념만 (쉼표 구분)
     python test_grounded_explain_eval.py generate train/fact_ctx.json train/fact_part.json "사이시옷,균역법"
 """

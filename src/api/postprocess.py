@@ -37,8 +37,10 @@ _MD_BOLD_PAIR     = re.compile(r"\*{2,3}(.+?)\*{2,3}", re.DOTALL)
 _MD_BOLD_LEFTOVER = re.compile(r"\*{2,}")
 # $...$ 안의 수식은 손대지 않는다. 치환 전에 빼뒀다가 마지막에 되돌린다.
 _LATEX_SPAN = re.compile(r"\$[^$\n]*\$")
+# 화살표(U+2190~21FF, → ⇔ 등)는 지우지 않는다. 예전엔 이 범위도 넣어 "DNA→mRNA"가 "DNA mRNA",
+# "|x|<a ⇔ -a<x<a"에서 ⇔가 사라졌다(2026-10-03 전체 점검). 이모지 화살표(➡ ⬅)는 다른 범위에 있다.
 _EMOJI     = re.compile(
-    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF️←-⇿⬀-⯿]"
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF️⬀-⯿]"
 )
 
 

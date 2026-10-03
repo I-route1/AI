@@ -18,8 +18,11 @@ import torch
 from transformers import LogitsProcessor
 
 # 한자(CJK 통합·확장 A·호환), 가나, 키릴, 힌디(데바나가리), 태국, 아랍, 히브리 문자.
+# 베트남어 글자(라틴 확장 추가 U+1E00~1EFF, ơ·ư)도 넣는다 — 미적분 설명에 "응 dụng 사례"가 섞였다
+# (2026-10-03). 수학·과학·영어에서 쓰는 영문자(A-Z)와 그리스 문자는 이 범위 밖이다.
 _FOREIGN_CHARS = ("぀-ヿ㐀-䶿一-鿿豈-﫿"
-                  "Ѐ-ӿऀ-ॿ฀-๿؀-ۿ֐-׿")
+                  "Ѐ-ӿऀ-ॿ฀-๿؀-ۿ֐-׿"
+                  "Ḁ-ỿƠơƯư")
 _FOREIGN = re.compile(f"[{_FOREIGN_CHARS}]")
 _FOREIGN_RUN = re.compile(f"[{_FOREIGN_CHARS}]+")
 _PAREN_HANJA = re.compile(r"\([㐀-䶿一-鿿豈-﫿·,\s]+\)")
