@@ -353,8 +353,10 @@ def detect_subject(query: str) -> str | None:
     for subject in _SUBJECT_KEYWORDS:
         if _concept_map_search(subject, query, 1):
             return subject
+    # 한 글자 키워드("시", "법")는 부분 문자열로 너무 자주 걸려 감지에서는 쓰지 않는다
+    # ("시간이 부족해요" → 국어). 목록 자체는 _filter_by_subject가 문서 필터로 같이 쓰므로 그대로 둔다.
     for subject, keywords in _SUBJECT_KEYWORDS.items():
-        if any(kw in query for kw in keywords):
+        if any(len(kw) >= 2 and kw in query for kw in keywords):
             return subject
     return None
 
