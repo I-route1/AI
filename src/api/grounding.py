@@ -91,3 +91,12 @@ def context_block(docs: list[str] | None) -> str:
 def concept_user_message(concept: str, docs: list[str] | None) -> str:
     """_concept_explain()의 user 메시지."""
     return f"{context_block(docs)}질문: '{concept}' 개념의 핵심 포인트를 학생에게 설명해주세요."
+
+
+def question_user_message(question: str, docs: list[str] | None) -> str:
+    """/api/ai/ask(학생이 직접 쓴 질문)의 user 메시지. 근거 규칙은 개념 설명과 같다."""
+    return (
+        f"{context_block(docs)}학생 질문: {question}\n\n"
+        "학생에게 직접 답하듯 핵심부터 간결하게 설명해주세요. "
+        "공부와 관련 없는 질문이면 학습 내용을 물어봐 달라고 한 문장으로만 답하세요."
+    )

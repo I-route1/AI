@@ -1,6 +1,6 @@
 """Qwen 생성 실패 → Ollama/규칙 기반 폴백 횟수 카운터(프로세스 메모리, 재기동하면 0).
 
-kind: "advice"(수학·국어·프리미엄 조언 문단) / "concept"(개념 설명)
+kind: "advice"(수학·국어·프리미엄 조언 문단) / "concept"(개념 설명) / "ask"(학생 질문 답변, /api/ai/ask)
 outcome: 최종 문장을 만든 쪽 — "qwen"(폴백 없음) / "ollama"(Qwen 실패 후 대체) / "none"(둘 다 실패, 규칙 기반 문구만)
 """
 import logging

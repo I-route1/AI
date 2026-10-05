@@ -6,7 +6,7 @@ from src.api import fallback_stats, model_registry
 from src.api.concept_map import search_concept_map
 from src.api.generation import OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_OPTIONS, OLLAMA_URL
 from src.api.java_client import get_student_weakness_from_java
-from src.api.grounding import context_block, is_curated
+from src.api.grounding import context_block, is_curated, question_user_message, usable_docs
 from src.api.postprocess import strip_markdown
 from src.api.script_guard import has_foreign, strip_foreign
 from src.api.routers.rag import detect_subject, subject_aware_search, vector_search, _SUBJECT_KEYWORDS
@@ -531,3 +531,44 @@ async def ai_search(req: dict):
     else:
         contexts = vector_search(query, k=5)
     return {"contexts": contexts}
+
+
+ASK_MAX_CHARS = 300
+
+
+@router.post("/ask")
+async def ai_ask(req: dict):
+    """학생이 직접 쓴 학습 질문에 답한다(Front 'AI에게 질문하기' → Backend /api/ai/ask).
+
+    과목은 요청의 subject, 없으면 질문에서 감지한다. 개념 추천과 같은 검색(ConceptMap → 그 과목
+    FAISS)으로 자료를 찾아 근거로 붙이고, 같은 생성 함수(_concept_explain)로 답한다 — 문자 차단·
+    후처리·근거 규칙이 개념 설명과 같다. Qwen이 실패하면 Ollama, 그것도 실패하면 answer=None.
+
+    과목을 알 수 없으면 생성하지 않고 needSubject=true를 돌려준다(과목별 system 프롬프트와 문자
+    차단이 과목에 따라 달라서 과목 없이 생성할 수 없다).
+    """
+    question = str(req.get("question") or "").strip()
+    if len(question) < 2:
+        raise HTTPException(status_code=400, detail="질문을 입력해 주세요.")
+    if len(question) > ASK_MAX_CHARS:
+        raise HTTPException(status_code=400, detail=f"질문은 {ASK_MAX_CHARS}자 이내로 입력해 주세요.")
+    subject = req.get("subject") or None
+    if subject is not None and subject not in _SUBJECT_KEYWORDS:
+        raise HTTPException(status_code=400, detail=f"지원하지 않는 과목입니다: {subject}")
+    subject = subject or detect_subject(question)
+    if subject is None:
+        return {"subject": None, "question": question, "answer": None, "grounded": False, "needSubject": True}
+
+    docs = subject_aware_search(subject, question, k=3)
+    grounded = bool(usable_docs(docs))
+    answer = None
+    concept_explain = model_registry.get("concept_explain")
+    if concept_explain:
+        answer = await run_in_threadpool(
+            concept_explain, subject, question, docs, question_user_message(question, docs))
+        if answer:
+            fallback_stats.record("ask", "qwen")
+    if not answer:
+        answer = await _ollama_analyze(question_user_message(question, docs))
+        fallback_stats.record("ask", "ollama" if answer else "none")
+    return {"subject": subject, "question": question, "answer": answer, "grounded": grounded, "needSubject": False}

@@ -233,10 +233,13 @@ _CONCEPT_USE_BASE: frozenset[str] = frozenset(SUBJECT_ADAPTERS) | {"수학"}
 
 
 def _concept_explain(subject: str, concept_query: str,
-                     context_docs: list[str] | None = None) -> str | None:
+                     context_docs: list[str] | None = None,
+                     user_message: str | None = None) -> str | None:
     """개념 설명 생성. 생성할 수 없으면 None(호출부에서 Ollama로 fallback).
 
     context_docs: 호출부가 이미 검색한 RAG 자료. 주면 근거로 붙인다(grounding.py).
+    user_message: 주면 개념 설명 대신 이 문장을 user 메시지로 쓴다(/api/ai/ask의 학생 질문).
+        생성 설정·문자 차단·후처리는 개념 설명과 같다.
 
     과목마다 어댑터를 쓸지 베이스를 쓸지 다르다 — _CONCEPT_USE_BASE 참고.
     어댑터가 항상 나은 것이 아니라서, 과목별로 측정해 정한 값이다.
@@ -263,7 +266,7 @@ def _concept_explain(subject: str, concept_query: str,
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": concept_user_message(concept_query, context_docs)},
+            {"role": "user", "content": user_message or concept_user_message(concept_query, context_docs)},
         ]
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
