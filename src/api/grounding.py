@@ -94,9 +94,15 @@ def concept_user_message(concept: str, docs: list[str] | None) -> str:
 
 
 def question_user_message(question: str, docs: list[str] | None) -> str:
-    """/api/ai/ask(학생이 직접 쓴 질문)의 user 메시지. 근거 규칙은 개념 설명과 같다."""
+    """/api/ai/ask(학생이 직접 쓴 질문)의 user 메시지. 근거 규칙은 개념 설명과 같다.
+
+    "한 음절은 한 글자" 문장: "평시조 종장 첫 음보는 몇 글자예요?"에 3번 중 2번 "3음절이며, 이는
+    9글자"라고 답했다(2026-10-05). ConceptMap에 "(세 글자)"를 넣어 막으려 하자 개념 설명에서
+    "'하늘'처럼 세 글자" 같은 틀린 예시가 새로 나와, 개념 설명·평가에 닿지 않는 이 프롬프트에만 둔다.
+    """
     return (
         f"{context_block(docs)}학생 질문: {question}\n\n"
         "학생에게 직접 답하듯 핵심부터 간결하게 설명해주세요. "
+        "글자 수나 음절 수를 말할 때 한국어는 한 음절이 한 글자입니다. "
         "공부와 관련 없는 질문이면 학습 내용을 물어봐 달라고 한 문장으로만 답하세요."
     )
