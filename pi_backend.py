@@ -15,6 +15,7 @@
 /api/wrong-answer/ai-pipeline(AI 서버 전용) 뿐이다.
 """
 import json
+import math
 import os
 import time
 import urllib.error
@@ -113,6 +114,67 @@ class BackendClient:
         raise BackendError(f"{MAX_RETRIES}회 재시도 후 실패: {last_err}")
 
     # ── 업로드 API ────────────────────────────────────────────────────────────
+    def save_posture_record(self, record: dict) -> dict:
+        """A stable submissionId makes a retry safe after an ambiguous timeout."""
+        if not isinstance(record, dict) or type(record.get("studentId")) is not int or record["studentId"] <= 0:
+            raise BackendError("자세 기록에는 양의 정수 학생 ID가 필요합니다.")
+        fields = ("uprightSamples", "slouchedSamples", "headDownSamples", "tiltedSamples",
+                  "unknownSamples", "noPersonSamples", "multiplePeopleSamples")
+        counts = [record.get(field) for field in fields]
+        total = record.get("totalSamples")
+        if any(type(value) is not int or not 0 <= value <= 86400 for value in counts):
+            raise BackendError("자세 표본 수는 0~86400의 정수여야 합니다.")
+        if type(total) is not int or not 1 <= total <= 86400 or sum(counts) != total:
+            raise BackendError("자세 표본 수의 합이 전체 표본 수와 일치해야 합니다.")
+        if record.get("inputSource") not in ("CAMERA", "IMAGE", "VIDEO"):
+            raise BackendError("자세 입력 출처가 올바르지 않습니다.")
+        duration = record.get("durationSeconds")
+        if type(duration) is not int or not 1 <= duration <= 86400:
+            raise BackendError("자세 측정 시간은 1~86400초의 정수여야 합니다.")
+        body = json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        try:
+            saved = self._request("POST", "/api/posture-records", body=body)
+        except (ValueError, TypeError) as error:
+            raise BackendError("자세 저장 API 응답 형식을 확인할 수 없습니다.") from error
+        if not isinstance(saved, dict) or type(saved.get("id")) is not int or saved["id"] <= 0:
+            raise BackendError("자세 저장 API 응답에 유효한 기록 ID가 없습니다.")
+        return saved
+
+    def get_posture_records(self, student_id: int, subject: str | None = None) -> list:
+        params = {"studentId": student_id}
+        if subject:
+            params["subject"] = subject
+        rows = self._request("GET", "/api/posture-records", params=params)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or row.get("studentId") != student_id for row in rows):
+            raise BackendError("학생의 자세 기록 응답을 확인할 수 없습니다.")
+        return rows
+
+    def get_wrong_answers(self, student_id: int, subject: str | None = None) -> list:
+        """학생의 전체 오답 조회. 과목을 생략하면 전 과목을 반환한다."""
+        return self._request("GET", f"/api/wrong-answer/{student_id}",
+                             params={"subject": subject} if subject else None)
+
+    def save_ocr_result(self, student_id: int, subject: str, submission_id: str,
+                        total_questions: int, correct_count: int, questions: list[dict]) -> dict:
+        """문항별 인식 문자열과 정오답을 함께 저장. 같은 submission_id 재전송은 중복 집계하지 않는다.
+
+        questions: questionId, expectedAnswer, recognizedText, similarity, correct,
+                   conceptTag, errorType(선택). 오답 기록은 백엔드가 같은 트랜잭션에서 처리한다.
+        """
+        payload = {"studentId": student_id, "subject": subject, "submissionId": submission_id,
+                   "totalQuestions": total_questions, "correctCount": correct_count, "questions": questions}
+        body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return self._request("POST", "/api/ocr-results", body=body)
+
+    def get_ocr_results(self, student_id: int, subject: str | None = None) -> list:
+        params = {"studentId": student_id}
+        if subject:
+            params["subject"] = subject
+        return self._request("GET", "/api/ocr-results", params=params)
+
+    def get_ocr_result(self, result_id: int, student_id: int) -> dict:
+        return self._request("GET", f"/api/ocr-results/{result_id}", params={"studentId": student_id})
+
     def record_wrong_answer(self, student_id: int, subject: str, question_id: str,
                             concept_tag: str, error_type: str | None = None) -> dict | None:
         """오답 1건 기록. POST /api/wrong-answer/record (쿼리 파라미터 방식).
@@ -133,7 +195,9 @@ class BackendClient:
     def save_learning_activity(self, student_id: int, subject: str, study_date: str,
                                study_start_time: str, duration_minutes: int,
                                understanding_score: int, concentration_score: int,
-                               instructor_feedback: str | None = None) -> dict | None:
+                               instructor_feedback: str | None = None, *,
+                               focused_ratio: float | None = None, drowsy_ratio: float | None = None,
+                               measurement_source: str = "MANUAL") -> dict | None:
         """학습 활동 1건 기록. POST /api/activities (JSON 바디).
 
         study_date: "YYYY-MM-DD", study_start_time: "HH:MM:SS"
@@ -145,6 +209,15 @@ class BackendClient:
                             ("concentration_score", concentration_score)):
             if not 1 <= score <= 5:
                 raise BackendError(f"{name}는 1~5여야 합니다: {score}")
+        if measurement_source not in ("MANUAL", "CAMERA"):
+            raise BackendError("measurement_source는 MANUAL 또는 CAMERA여야 합니다.")
+        for name, ratio in (("focused_ratio", focused_ratio), ("drowsy_ratio", drowsy_ratio)):
+            if ratio is not None and (not math.isfinite(ratio) or not 0 <= ratio <= 1):
+                raise BackendError(f"{name}는 0~1의 유한한 비율이어야 합니다: {ratio}")
+        if measurement_source == "CAMERA" and (focused_ratio is None or drowsy_ratio is None):
+            raise BackendError("CAMERA 측정에는 focused_ratio와 drowsy_ratio가 모두 필요합니다.")
+        if focused_ratio is not None and drowsy_ratio is not None and focused_ratio + drowsy_ratio > 1 + 1e-9:
+            raise BackendError("집중·졸음 비율의 합은 1 이하여야 합니다.")
         payload = {
             "studentId": student_id,
             "subject": subject,
@@ -153,6 +226,9 @@ class BackendClient:
             "studyDurationMinutes": duration_minutes,
             "understandingScore": understanding_score,
             "concentrationScore": concentration_score,
+            "focusedRatio": focused_ratio,
+            "drowsyRatio": drowsy_ratio,
+            "measurementSource": measurement_source,
             "instructorFeedback": instructor_feedback or "",
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

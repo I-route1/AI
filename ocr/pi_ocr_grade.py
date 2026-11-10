@@ -23,7 +23,7 @@ concept_tag가 없으면 --subject 값으로 대체하고, error_type은 생략 
     # 채점만
     python ocr/pi_ocr_grade.py --image worksheet.jpg --questions questions.json
 
-    # 채점 후 오답을 백엔드에 기록 (.env에 BACKEND_URL과 토큰/계정 필요)
+    # 채점 전체 결과와 오답을 백엔드에 기록 (.env에 BACKEND_URL과 토큰/계정 필요)
     python ocr/pi_ocr_grade.py --image worksheet.jpg --questions questions.json \
         --upload --student-id 14 --subject 국어
 """
@@ -33,11 +33,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from ocr.grading import grade_worksheet
-from ocr.inference import OCRRecognizer
 
 
 def main():
+    from ocr.grading import grade_worksheet
+    from ocr.inference import OCRRecognizer
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True, help="채점할 워크시트 이미지 경로")
     ap.add_argument("--questions", required=True, help="문항 정의 JSON 경로")
@@ -47,7 +48,9 @@ def main():
     # 떨어지고, 잘라 내면 0.78로 회복된다(ocr/eval_ocr.py, eval/ocr_eval_trim.json).
     ap.add_argument("--no-trim", action="store_true",
                     help="답 칸의 빈 여백을 잘라 내지 않음 (bbox를 글씨에 딱 맞게 잡은 경우)")
-    ap.add_argument("--upload", action="store_true", help="채점 후 오답을 백엔드에 기록")
+    ap.add_argument("--upload", action="store_true", help="채점 전체 결과와 오답을 백엔드에 기록")
+    ap.add_argument("--submission-id", default=None,
+                    help="채점 제출 ID (기본: UUID). 같은 결과를 재업로드할 때 같은 ID를 사용")
     ap.add_argument("--student-id", type=int, default=None,
                     help="업로드 대상 학생 ID (기본: .env의 STUDENT_ID)")
     ap.add_argument("--subject", default=None, help="업로드 시 과목명 (예: 국어)")
@@ -72,13 +75,13 @@ def main():
     print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
 
     if args.upload:
-        _upload_wrong_answers(report, regions, args)
+        _upload_report(report, regions, args)
 
 
-def _upload_wrong_answers(report, regions: list[dict], args) -> None:
-    """오답만 골라 백엔드에 기록. 네트워크 실패로 채점 결과 출력까지 날리지 않도록
-    예외를 삼키고 요약만 남긴다 (채점 결과는 이미 stdout에 찍혀 있다)."""
+def _upload_report(report, regions: list[dict], args) -> None:
+    """정답을 포함한 전체 채점 결과 저장. 오답 누적은 백엔드에서 원자적으로 처리한다."""
     import os
+    import uuid
     from pi_backend import BackendClient, BackendError
 
     student_id = args.student_id or (int(os.getenv("STUDENT_ID")) if os.getenv("STUDENT_ID") else None)
@@ -86,35 +89,28 @@ def _upload_wrong_answers(report, regions: list[dict], args) -> None:
         print("[업로드] 학생 ID가 없습니다 — --student-id 또는 .env의 STUDENT_ID를 설정하세요.")
         return
 
-    meta = {r.get("question_id"): r for r in regions}
-    wrong = [r for r in report.results if not r.is_correct]
-    if not wrong:
-        print("[업로드] 오답이 없어 전송할 내용이 없습니다.")
+    if not report.results:
+        print("[업로드] 채점한 문항이 없습니다.")
         return
-
+    meta = {str(r.get("question_id")): r for r in regions}
+    questions = []
+    for result in report.results:
+        question_id = str(result.question_id)
+        m = meta.get(question_id, {})
+        questions.append({
+            "questionId": question_id, "expectedAnswer": result.expected,
+            "recognizedText": result.recognized, "similarity": result.similarity,
+            "correct": result.is_correct, "conceptTag": m.get("concept_tag") or args.subject,
+            "errorType": m.get("error_type"),
+        })
+    submission_id = args.submission_id or str(uuid.uuid4())
+    print(f"[업로드] 제출 ID: {submission_id} (재전송 시 --submission-id에 사용)")
     try:
-        client = BackendClient()
+        saved = BackendClient().save_ocr_result(student_id, args.subject, submission_id,
+                                               report.total, report.score, questions)
+        print(f"[업로드] 채점 결과 #{saved['id']} 저장 — {report.score}/{report.total}, 오답 함께 기록")
     except BackendError as e:
-        print(f"[업로드] 설정 오류로 건너뜁니다: {e}")
-        return
-
-    sent = failed = 0
-    for r in wrong:
-        m = meta.get(r.question_id, {})
-        try:
-            client.record_wrong_answer(
-                student_id=student_id,
-                subject=args.subject,
-                question_id=r.question_id,
-                concept_tag=m.get("concept_tag") or args.subject,
-                error_type=m.get("error_type"),
-            )
-            sent += 1
-        except BackendError as e:
-            failed += 1
-            print(f"[업로드] Q{r.question_id} 실패: {e}")
-
-    print(f"[업로드] 오답 {len(wrong)}건 중 {sent}건 기록, {failed}건 실패")
+        print(f"[업로드] 실패: {e}")
 
 
 if __name__ == "__main__":
