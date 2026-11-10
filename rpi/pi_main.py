@@ -5,8 +5,8 @@
 Pi5에서:
     pip install dlib opencv-python joblib
     python rpi/pi_main.py
-포즈 추정(HailoPoseEstimator)은 pose_hailo.py의 decode_keypoints()가 구현되기 전까지
-자동으로 비활성화되고 집중도 분류만 동작한다.
+Hailo 모델은 POSE_HEF_PATH 또는 공식 hailo-models 설치 경로에서 읽는다.
+얼굴 측정을 제외하고 자세만 분석하려면 --pose-only를 사용한다(pose_main.py 인자 지원).
 
 종료(Ctrl+C) 시 세션을 집계해 백엔드 POST /api/activities 로 올리려면:
     python rpi/pi_main.py --upload --student-id 14 --subject 수학 --understanding 4
@@ -25,24 +25,22 @@ import time
 from collections import Counter
 from pathlib import Path
 
-import cv2
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from rpi.live_attention import AttentionEstimator
-from rpi.posture_heuristic import classify_posture
+from rpi.posture_session import PostureSession
 
-POSE_HEF_PATH = Path(__file__).parent / "yolov8_pose.hef"
 INFER_INTERVAL_SEC = 1.0  # AI-Hub 라벨의 10초 구간보다 촘촘하게, 1초마다 판단
 FOCUSED_LABEL = "집중"    # rpi/dataset.py CATEGORY_NAMES = ["집중", "집중하지않음", "졸음"]
 
 
 def try_load_pose_estimator():
-    if not POSE_HEF_PATH.exists():
-        print(f"[Pose] .hef 없음({POSE_HEF_PATH}) — 자세 추정 비활성화")
+    from rpi.pose_hailo import default_hef_path
+    path = default_hef_path()
+    if not path.exists():
+        print(f"[Pose] .hef 없음({path}) — 자세 추정 비활성화")
         return None
     try:
         from rpi.pose_hailo import HailoPoseEstimator
-        return HailoPoseEstimator(POSE_HEF_PATH)
+        return HailoPoseEstimator(path)
     except Exception as e:
         print(f"[Pose] 초기화 실패({e}) — 자세 추정 비활성화")
         return None
@@ -87,6 +85,7 @@ def _upload_session(args, counts: Counter, started_at: float) -> None:
         return
 
     focused_ratio = counts[FOCUSED_LABEL] / graded
+    drowsy_ratio = counts["졸음"] / graded
     concentration = _to_stars(focused_ratio)
     duration_min = max(1, round((time.time() - started_at) / 60))
 
@@ -99,6 +98,9 @@ def _upload_session(args, counts: Counter, started_at: float) -> None:
             duration_minutes=duration_min,
             understanding_score=args.understanding,
             concentration_score=concentration,
+            focused_ratio=focused_ratio,
+            drowsy_ratio=drowsy_ratio,
+            measurement_source="CAMERA",
         )
         print(f"[업로드] 기록 완료 — {duration_min}분, 집중 {focused_ratio * 100:.0f}% → 집중도 {concentration}/5, "
               f"이해도 {args.understanding}/5")
@@ -106,21 +108,53 @@ def _upload_session(args, counts: Counter, started_at: float) -> None:
         print(f"[업로드] 실패: {e}")
 
 
+def _upload_posture_session(args, session):
+    if session is None or session.total == 0:
+        return
+    import os
+    from pi_backend import BackendClient, BackendError
+    from rpi.pose_main import persist_report
+    student_id = args.student_id or (int(os.environ['STUDENT_ID']) if os.getenv('STUDENT_ID') else None)
+    if not student_id:
+        print('[자세 업로드] 학생 ID가 없습니다.')
+        return
+    record = session.record(student_id, args.subject)
+    path = None
+    try:
+        path = persist_report(record)
+        saved = BackendClient().save_posture_record(record)
+        print(f"[자세 업로드] #{saved['id']} 저장, 보고서: {path}")
+    except (BackendError, OSError, ValueError) as error:
+        retry = f'; python rpi/pose_main.py --retry {path}' if path else ''
+        print(f'[자세 업로드 실패] {error}{retry}')
+
+
 def main():
+    if '--pose-only' in sys.argv[1:]:
+        from rpi.pose_main import main as pose_main
+        return pose_main([argument for argument in sys.argv[1:] if argument != '--pose-only'])
+    import cv2
+    from rpi.live_attention import AttentionEstimator
+
     args = _parse_args()
     attention = AttentionEstimator()
     pose_estimator = try_load_pose_estimator()
+    pose_session = PostureSession('CAMERA', pose_estimator.path.stem) if pose_estimator else None
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
+        cap.release()
+        if pose_estimator:
+            pose_estimator.close()
         raise RuntimeError("카메라를 열 수 없습니다 (index 0)")
 
     last_infer = 0.0
     counts: Counter = Counter()
     started_at = time.time()
+    started_monotonic = time.monotonic()
     print("실행 시작 (Ctrl+C로 종료)")
     try:
-        while True:
+        while time.monotonic() - started_monotonic < 86400:
             ok, frame = cap.read()
             if not ok:
                 continue
@@ -144,22 +178,24 @@ def main():
 
             if pose_estimator:
                 try:
-                    resized = cv2.resize(frame, pose_estimator._input_shape[:2][::-1])
-                    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     people = pose_estimator.infer(rgb)
-                    if people:
-                        posture = classify_posture(people[0])
-                        status["자세"] = posture.label
-                except NotImplementedError:
-                    pass
+                    status['자세'] = pose_session.add(people, frame.shape[:2])
                 except Exception as e:
                     print(f"[Pose] 추론 오류: {e}")
+                    pose_estimator.close()
+                    pose_estimator = None
+                    pose_session = None
 
             print(status)
     except KeyboardInterrupt:
         pass
     finally:
         cap.release()
+        if pose_session:
+            pose_session.finish()
+        if pose_estimator:
+            pose_estimator.close()
         if counts:
             total = sum(counts.values())
             print("\n=== 세션 요약 ===")
@@ -168,7 +204,8 @@ def main():
             print(f"  측정 시간: {(time.time() - started_at) / 60:.1f}분")
         if args.upload:
             _upload_session(args, counts, started_at)
+            _upload_posture_session(args, pose_session)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

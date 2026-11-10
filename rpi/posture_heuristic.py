@@ -5,6 +5,7 @@ AI-Hub 데이터에 실제 전신 자세 라벨이 없어 학습된 모델이 �
 임계값은 실제 카메라 설치 각도/거리에 맞춰 캘리브레이션이 필요하다.
 """
 from dataclasses import dataclass
+import math
 
 # COCO-17 keypoint 인덱스 (YOLOv8-pose 기본 출력 순서)
 NOSE, L_EYE, R_EYE, L_EAR, R_EAR = 0, 1, 2, 3, 4
@@ -22,11 +23,21 @@ class PostureResult:
 
 
 def classify_posture(keypoints: list[tuple[float, float, float]],
-                      conf_th: float = 0.4) -> PostureResult:
+                      conf_th: float = 0.4, image_shape=None) -> PostureResult:
     """keypoints: 길이 17의 (x, y, confidence) 리스트 (YOLOv8-pose 출력 그대로)."""
+    if len(keypoints) != 17:
+        return PostureResult("판단불가", 0.0, 0.0)
+
     def pt(idx):
-        x, y, c = keypoints[idx]
-        return (x, y) if c >= conf_th else None
+        try:
+            x, y, c = map(float, keypoints[idx])
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in (x, y, c)) or not conf_th <= c <= 1 or x < 0 or y < 0:
+            return None
+        if image_shape and (x >= image_shape[1] or y >= image_shape[0]):
+            return None
+        return x, y
 
     nose = pt(NOSE)
     l_sh, r_sh = pt(L_SHOULDER), pt(R_SHOULDER)
@@ -35,7 +46,10 @@ def classify_posture(keypoints: list[tuple[float, float, float]],
         return PostureResult("판단불가", 0.0, 0.0)
 
     shoulder_mid = ((l_sh[0] + r_sh[0]) / 2, (l_sh[1] + r_sh[1]) / 2)
-    shoulder_width = max(abs(l_sh[0] - r_sh[0]), 1e-3)
+    shoulder_width = abs(l_sh[0] - r_sh[0])
+    minimum_width = image_shape[1] * 0.02 if image_shape else 1e-6
+    if shoulder_width <= minimum_width:
+        return PostureResult("판단불가", 0.0, 0.0)
 
     # 어깨 좌우 기울기 (좌우 y 차이 / 어깨너비)
     shoulder_tilt = abs(l_sh[1] - r_sh[1]) / shoulder_width
