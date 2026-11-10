@@ -1,6 +1,7 @@
 import io
 import json
 import math
+import os
 import unittest
 import urllib.error
 from collections import Counter
@@ -33,6 +34,22 @@ class BackendClientTest(unittest.TestCase):
         self.assertEqual(payload["submissionId"], "same-id")
         self.assertEqual(payload["questions"], questions)
         self.assertEqual(requests[0].get_header("Authorization"), "Bearer test-jwt")
+
+    @patch("urllib.request.urlopen")
+    def test_expired_token_reauthenticates_and_retries_identical_body(self, urlopen):
+        urlopen.side_effect = [
+            urllib.error.HTTPError('http://backend.test/api/posture-records', 401, 'Expired', {}, io.BytesIO(b'{}')),
+            io.BytesIO(b'{"accessToken":"renewed-jwt"}'),
+            io.BytesIO(b'{"id":2}'),
+        ]
+        with patch.dict(os.environ, {"BACKEND_USERNAME": "test-user", "BACKEND_PASSWORD": "test-password"}, clear=True):
+            saved = self.client._request('POST', '/api/posture-records', body=b'{"submissionId":"same-id"}')
+        requests = [call.args[0] for call in urlopen.call_args_list]
+        self.assertEqual(saved, {"id": 2})
+        self.assertEqual(requests[1].full_url, 'http://backend.test/api/auth/login')
+        self.assertEqual(requests[0].data, requests[2].data)
+        self.assertEqual(requests[0].get_header('Authorization'), 'Bearer test-jwt')
+        self.assertEqual(requests[2].get_header('Authorization'), 'Bearer renewed-jwt')
 
     @patch.object(BackendClient, "_request", return_value=[])
     def test_read_apis(self, request):

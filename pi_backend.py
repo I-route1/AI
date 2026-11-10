@@ -85,11 +85,10 @@ class BackendClient:
         headers = {"Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = "application/json; charset=utf-8"
-        if authed:
-            headers["Authorization"] = f"Bearer {self._ensure_token()}"
-
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
+            if authed:
+                headers["Authorization"] = f"Bearer {self._ensure_token()}"
             req = urllib.request.Request(url, data=body, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
