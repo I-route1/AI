@@ -17,7 +17,10 @@
 import json
 import math
 import os
+import re
 import time
+import unicodedata
+from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -95,7 +98,8 @@ class BackendClient:
                     raw = resp.read().decode("utf-8").strip()
                     return json.loads(raw) if raw else None
             except urllib.error.HTTPError as e:
-                detail = e.read().decode("utf-8", "replace")[:300]
+                with e:
+                    detail = e.read().decode("utf-8", "replace")[:300]
                 # 4xx는 재시도해도 같은 결과 — 인증 만료(401)만 토큰을 버리고 한 번 더 시도
                 if e.code == 401 and authed and attempt == 1 and not os.getenv("BACKEND_TOKEN"):
                     self._token = None
@@ -115,7 +119,7 @@ class BackendClient:
     # ── 업로드 API ────────────────────────────────────────────────────────────
     def save_posture_record(self, record: dict) -> dict:
         """A stable submissionId makes a retry safe after an ambiguous timeout."""
-        if not isinstance(record, dict) or type(record.get("studentId")) is not int or record["studentId"] <= 0:
+        if not isinstance(record, dict) or type(record.get("studentId")) is not int or not 1 <= record["studentId"] <= 9223372036854775807:
             raise BackendError("자세 기록에는 양의 정수 학생 ID가 필요합니다.")
         fields = ("uprightSamples", "slouchedSamples", "headDownSamples", "tiltedSamples",
                   "unknownSamples", "noPersonSamples", "multiplePeopleSamples")
@@ -127,6 +131,20 @@ class BackendClient:
             raise BackendError("자세 표본 수의 합이 전체 표본 수와 일치해야 합니다.")
         if record.get("inputSource") not in ("CAMERA", "IMAGE", "VIDEO"):
             raise BackendError("자세 입력 출처가 올바르지 않습니다.")
+        for field, pattern in (("submissionId", r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}"),
+                               ("modelName", r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")):
+            if not isinstance(record.get(field), str) or not re.fullmatch(pattern, record[field]):
+                raise BackendError(f"자세 기록의 {field} 형식이 올바르지 않습니다.")
+        subject = record.get("subject")
+        if not isinstance(subject, str) or any(unicodedata.category(char) == "Cs" for char in subject) or not 1 <= len(subject.encode("utf-16-le")) // 2 <= 255 or not any(
+                not char.isspace() and unicodedata.category(char) not in ("Cf", "Cc", "Cs") for char in subject):
+            raise BackendError("자세 기록에는 공백이 아닌 과목명이 필요합니다.")
+        try:
+            started = datetime.fromisoformat(record["startedAt"])
+            if started.tzinfo is None or not 1000 <= started.year <= 9999 or not 1000 <= started.astimezone(timezone.utc).year <= 9999:
+                raise ValueError()
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise BackendError("자세 기록의 측정 시각에는 올바른 날짜와 시간대가 필요합니다.") from error
         duration = record.get("durationSeconds")
         if type(duration) is not int or not 1 <= duration <= 86400:
             raise BackendError("자세 측정 시간은 1~86400초의 정수여야 합니다.")
@@ -137,6 +155,8 @@ class BackendClient:
             raise BackendError("자세 저장 API 응답 형식을 확인할 수 없습니다.") from error
         if not isinstance(saved, dict) or type(saved.get("id")) is not int or saved["id"] <= 0:
             raise BackendError("자세 저장 API 응답에 유효한 기록 ID가 없습니다.")
+        if type(saved.get("studentId")) is not int or saved["studentId"] != record["studentId"] or saved.get("submissionId") != record["submissionId"]:
+            raise BackendError("자세 저장 API 응답의 학생 또는 제출 ID가 일치하지 않습니다.")
         return saved
 
     def get_posture_records(self, student_id: int, subject: str | None = None) -> list:

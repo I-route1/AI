@@ -37,8 +37,9 @@ class BackendClientTest(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_expired_token_reauthenticates_and_retries_identical_body(self, urlopen):
+        expired = urllib.error.HTTPError('http://backend.test/api/posture-records', 401, 'Expired', {}, io.BytesIO(b'{}'))
         urlopen.side_effect = [
-            urllib.error.HTTPError('http://backend.test/api/posture-records', 401, 'Expired', {}, io.BytesIO(b'{}')),
+            expired,
             io.BytesIO(b'{"accessToken":"renewed-jwt"}'),
             io.BytesIO(b'{"id":2}'),
         ]
@@ -50,6 +51,7 @@ class BackendClientTest(unittest.TestCase):
         self.assertEqual(requests[0].data, requests[2].data)
         self.assertEqual(requests[0].get_header('Authorization'), 'Bearer test-jwt')
         self.assertEqual(requests[2].get_header('Authorization'), 'Bearer renewed-jwt')
+        self.assertTrue(expired.closed)
 
     @patch.object(BackendClient, "_request", return_value=[])
     def test_read_apis(self, request):
