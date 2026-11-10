@@ -44,8 +44,10 @@ def letterbox(frame_rgb, size):
 def decode_detections(outputs, input_shape=(640, 640), *, score_threshold=0.6,
                       iou_threshold=0.7, max_detections=100):
     """Decode dequantized HWC arrays while retaining all 17 joints in COCO order."""
-    if not 0 < score_threshold <= 1 or not 0 < iou_threshold <= 1 or max_detections < 1:
+    if not 0 < score_threshold <= 1 or not 0 < iou_threshold <= 1 or type(max_detections) is not int or max_detections < 1:
         raise ValueError("Invalid pose thresholds")
+    if len(input_shape) != 2 or any(type(value) is not int or value <= 0 or value % 32 for value in input_shape):
+        raise ValueError("Pose dimensions must be positive multiples of 32")
     levels = {}
     for name, value in outputs.items():
         array = np.asarray(value)
@@ -119,7 +121,10 @@ class HailoPoseEstimator:
             self.target = self._resources.enter_context(VDevice())
             config = ConfigureParams.create_from_hef(self.hef, interface=HailoStreamInterface.PCIe)
             self.network_group = self.target.configure(self.hef, config)[0]
-            self.input_info = self.hef.get_input_vstream_infos()[0]
+            input_infos = self.hef.get_input_vstream_infos()
+            if len(input_infos) != 1 or len(input_infos[0].shape) != 3 or input_infos[0].shape[-1] != 3:
+                raise ValueError("Expected a single RGB pose input")
+            self.input_info = input_infos[0]
             self.output_infos = self.hef.get_output_vstream_infos()
             self._input_shape = tuple(self.input_info.shape)
             decode_detections({i.name: np.zeros(i.shape, dtype=np.float32) for i in self.output_infos}, self._input_shape[:2])

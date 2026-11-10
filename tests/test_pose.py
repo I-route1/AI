@@ -131,7 +131,7 @@ class PostureTest(unittest.TestCase):
             with self.assertRaises(FileExistsError): persist_report(record, path)
         with self.assertRaises(ValueError): persist_report({**record, 'submissionId': '../../unsafe'})
 
-    @patch.object(BackendClient, '_request', return_value={'id': 1})
+    @patch.object(BackendClient, '_request', return_value={'id': 1, 'studentId': 2, 'submissionId': 'test'})
     def test_posture_upload_uses_separate_endpoint_and_rejects_bad_counters(self, request):
         session = PostureSession('IMAGE', submission_id='test'); session.add([person()])
         record = session.record(2, '수학')

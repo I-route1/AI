@@ -3,8 +3,10 @@ import argparse
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,10 +19,24 @@ def persist_report(record, output=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", record["submissionId"]):
         raise ValueError("Invalid submission ID")
     destination = Path(output) if output else Path.home() / ".local/state/i-route/posture" / (record["submissionId"] + ".json")
+    encoded = json.dumps(record, ensure_ascii=False, allow_nan=False, indent=2)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("x", encoding="utf-8") as stream:
-        os.chmod(destination, 0o600)
-        json.dump(record, stream, ensure_ascii=False, indent=2)
+    # Publish only a complete, flushed file. link() preserves exclusive creation even with concurrent writers.
+    descriptor, temporary = tempfile.mkstemp(prefix=".posture-", suffix=".tmp", dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, destination)
+        if hasattr(os, "O_DIRECTORY"):
+            directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return destination
 
 
@@ -69,6 +85,8 @@ def main(argv=None):
                 raise ValueError('A retry must keep the original student ID')
             if args.subject is not None and args.subject != record.get('subject'):
                 raise ValueError('A retry must keep the original subject')
+            if args.submission_id is not None and args.submission_id != record.get('submissionId'):
+                raise ValueError('A retry must keep the original submission ID')
             saved = BackendClient().save_posture_record(record)
             print(f"[자세 저장] #{saved['id']} (동일 제출 ID 재전송)")
             return 0
@@ -81,8 +99,8 @@ def main(argv=None):
         parser.error("STUDENT_ID must be a positive integer")
     if args.subject is not None:
         args.subject = args.subject.strip()
-        if len(args.subject) > 255:
-            parser.error("--subject is too long")
+        if not args.subject or len(args.subject) > 255:
+            parser.error("--subject must contain 1..255 characters")
     if args.upload and (not student_id or not args.subject):
         parser.error("--upload requires a student ID and --subject")
     if student_id is not None and student_id <= 0:
@@ -93,6 +111,10 @@ def main(argv=None):
         parser.error("--interval must be 0.05..60 and --max-samples must be 1..86400")
     if args.seconds is not None and not 0 < args.seconds <= 86400:
         parser.error("--seconds must be greater than 0 and at most 86400")
+    if args.camera_index < 0:
+        parser.error("--camera-index must be non-negative")
+    if args.input != "camera" and not Path(args.input).is_file():
+        parser.error("--input must be an existing image or video file")
     import cv2
     source = "CAMERA" if args.input == "camera" else ("IMAGE" if Path(args.input).suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp") else "VIDEO")
     capture = None
@@ -138,8 +160,8 @@ def main(argv=None):
         if capture is not None:
             capture.release()
     if session is None or not session.total:
-        print("[자세] 전송할 표본이 없습니다.")
-        return 0
+        print("[자세 분석 실패] 입력에서 분석할 프레임을 읽지 못했습니다.", file=sys.stderr)
+        return 1
     record = session.record(student_id, args.subject or "수학")
     try:
         path = persist_report(record, args.output)
@@ -153,7 +175,7 @@ def main(argv=None):
             saved = BackendClient().save_posture_record(record)
             print(f"[자세 저장] #{saved['id']}", flush=True)
         except BackendError as error:
-            print(f"[자세 저장 실패] {error}; --retry {path} 로 같은 결과를 재전송하세요.", file=sys.stderr)
+            print(f"[자세 저장 실패] {error}; --retry {shlex.quote(str(path))} 로 같은 결과를 재전송하세요.", file=sys.stderr)
             return 1
     return 0
 
