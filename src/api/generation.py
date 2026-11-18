@@ -9,6 +9,9 @@
   1~3초라 부담이 없다.
 """
 
+import os
+
+
 CONCEPT_GEN = dict(max_new_tokens=800, temperature=0.3, do_sample=True, repetition_penalty=1.2)
 # 평가용 결정적 디코딩. 한도와 반복 벌점은 서빙과 같다.
 CONCEPT_GEN_GREEDY = dict(max_new_tokens=800, do_sample=False, repetition_penalty=1.2)
@@ -19,9 +22,24 @@ CONCEPT_GEN_GREEDY = dict(max_new_tokens=800, do_sample=False, repetition_penalt
 ADVICE_GEN = dict(max_new_tokens=300, temperature=0.4, do_sample=True, repetition_penalty=1.2)
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3.1:latest"
+OLLAMA_MODEL = os.getenv("AI_OLLAMA_MODEL", "llama3.1:latest")
 # num_ctx: 참고 자료가 붙으면 한국어가 2천 토큰 가까이 된다.
 OLLAMA_OPTIONS = {"num_predict": 400, "temperature": 0.4, "num_ctx": 4096}
 # Ollama는 기본으로 5분 쉬면 모델을 내린다. 다시 올리는 데 수 초가 들어 요청이 드문 시연 중에
 # 첫 리포트가 20초 타임아웃에 걸릴 수 있다. 서버가 떠 있는 동안은 올려 둔다.
-OLLAMA_KEEP_ALIVE = "2h"
+OLLAMA_KEEP_ALIVE = os.getenv("AI_OLLAMA_KEEP_ALIVE", "2h")
+OLLAMA_CPU = os.getenv("AI_OLLAMA_CPU", "0") == "1"
+if OLLAMA_CPU:
+    OLLAMA_OPTIONS.update(num_gpu=0, num_thread=8)
+
+
+def ollama_request(prompt: str | None = None, *, max_tokens: int | None = None) -> dict:
+    options = OLLAMA_OPTIONS.copy()
+    if max_tokens is not None:
+        options["num_predict"] = max_tokens
+    payload = {"model": OLLAMA_MODEL, "keep_alive": OLLAMA_KEEP_ALIVE, "options": options}
+    if prompt is not None:
+        payload.update(prompt=prompt, stream=False)
+    if OLLAMA_MODEL.split(":", 1)[0] == "qwen3":
+        payload["think"] = False
+    return payload

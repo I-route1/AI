@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import hmac
+import logging
 import threading
 
 from fastapi import FastAPI, Query
@@ -36,8 +37,8 @@ from src.api.adapters import (
     MATH_SYSTEM_PROMPT, SUBJECT_ADAPTERS,
 )
 from src.api.routers import counseling, predictor, writing, rag
-from src.api.routers.counseling import _ollama_analyze
-from src.api.generation import ADVICE_GEN, CONCEPT_GEN
+from src.api.routers.counseling import _material_lines, _report_ollama
+from src.api.generation import ADVICE_GEN, CONCEPT_GEN, ollama_request
 from src.api.postprocess import strip_chat_frame, strip_markdown, trim_cut_tail
 from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
                                   latin_token_mask, strip_foreign, RareHangulBlocker)
@@ -76,72 +77,56 @@ async def _require_ai_key(request, call_next):
 # catch-all이라, 먼저 등록하면 이 파일의 @app.post("/api/ai/report/subject-recommend")를
 # 가로챈다(FastAPI는 등록 순서대로 매칭). 자세한 설명은 파일 하단 참고.
 
-# 4bit 양자화 설정
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True
-)
-
-print("📥 base 모델 로드 중 (4bit)...")
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-base_model = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL_ID,
-    quantization_config=bnb_config,
-    device_map={"": 0},
-)
-
-print("📥 수학 어댑터 로드 중...")
-base_model = PeftModel.from_pretrained(base_model, MATH_ADAPTER_PATH, adapter_name="math")
-print("✅ 수학 어댑터 로드 완료")
-
-# 글쓰기 어댑터는 /api/writing/* 전용인데, 그 라우터를 Backend·Front 어디서도
-# 호출하지 않는다(2026-09-23 확인). 서술형 답안을 제출받는 기능이 생기면 True로.
-# 꺼져 있으면 /api/writing/evaluate는 규칙 기반 피드백만 내고 llm_score는 None이다.
+# These adapters are optional. The curriculum questions use the base model.
 LOAD_WRITING_ADAPTER = False
-
-if LOAD_WRITING_ADAPTER:
-    print("📥 글쓰기 어댑터 로드 중...")
-    base_model.load_adapter(WRITING_ADAPTER_PATH, adapter_name="writing")
-    print("✅ 글쓰기 어댑터 로드 완료")
-else:
-    print("ℹ️ 글쓰기 어댑터는 로드하지 않습니다 (/api/writing 소비처 없음, 약 167MB 절약)")
-
-# 교과 어댑터(korean/english/science/social)는 **로드하지 않는다.**
-#
-# 쓰이던 곳이 _concept_explain() 하나뿐이었는데, 거기서 베이스가 더 낫다는 것이
-# 측정으로 확인돼 전 과목 베이스로 돌렸다(_CONCEPT_USE_BASE 참고). 그래서 지금은
-# 올려두기만 하고 호출되지 않는다. 개당 166MB, 4개면 약 668MB의 VRAM과
-# 기동 시간을 그냥 쓴다.
-#
-# 프롬프트를 학습 형식([학습 지문]/[교육과정 성취기준]/질문:)에 맞추면 회복될까
-# 싶어 재봤지만 오히려 격차가 벌어졌다(개념F1 기준 베이스-어댑터 차이가
-# +0.070 → +0.105, 4과목 모두 유의). 학습 형식을 주니 학습한 대로 더 짧은
-# 교과서 답안을 내놓는다 — 출력이 112자에서 68자로 줄었다. 개념 설명은
-# 그 어댑터들이 학습한 과제가 아니다.
-#
-# 어댑터 파일은 train/에 그대로 있으므로 아래를 True로 바꾸면 되돌릴 수 있다.
 LOAD_SUBJECT_ADAPTERS = False
-
 _LOADED_SUBJECT_ADAPTERS: set[str] = set()
-if LOAD_SUBJECT_ADAPTERS:
-    # 하나라도 실패하면 해당 과목만 Ollama fallback으로 떨어지고 기동은 계속한다.
-    for _subject, (_adapter_name, _adapter_path, _) in SUBJECT_ADAPTERS.items():
-        try:
-            print(f"📥 {_subject} 어댑터 로드 중...")
-            base_model.load_adapter(_adapter_path, adapter_name=_adapter_name)
-            _LOADED_SUBJECT_ADAPTERS.add(_subject)
-            print(f"✅ {_subject} 어댑터 로드 완료")
-        except Exception as _e:
-            print(f"⚠️ {_subject} 어댑터 로드 실패 — Ollama fallback 사용: {_e}")
-else:
-    print("ℹ️ 교과 어댑터 4개는 로드하지 않습니다 (개념 설명은 베이스 사용, 약 668MB 절약)")
+_GENERATION_MODE = os.getenv("AI_GENERATION_MODE", "auto").strip().lower()
+if _GENERATION_MODE not in {"auto", "cuda", "ollama"}:
+    raise ValueError("AI_GENERATION_MODE must be auto, cuda, or ollama")
 
-base_model.set_adapter("math")
+
+def _load_cuda_model():
+    quantization = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_ID, quantization_config=quantization, device_map={"": 0},
+    )
+    model = PeftModel.from_pretrained(model, MATH_ADAPTER_PATH, adapter_name="math")
+    if LOAD_WRITING_ADAPTER:
+        model.load_adapter(WRITING_ADAPTER_PATH, adapter_name="writing")
+    if LOAD_SUBJECT_ADAPTERS:
+        for subject, (adapter, path, _) in SUBJECT_ADAPTERS.items():
+            try:
+                model.load_adapter(path, adapter_name=adapter)
+                _LOADED_SUBJECT_ADAPTERS.add(subject)
+            except Exception as error:
+                logging.warning("[%s] 어댑터 로드 실패: %s", subject, type(error).__name__)
+    model.set_adapter("math")
+    return model, tokenizer
+
+
+base_model = tokenizer = None
+if _GENERATION_MODE != "ollama" and torch.cuda.is_available():
+    try:
+        free_vram, _ = torch.cuda.mem_get_info()
+        if _GENERATION_MODE == "cuda" or free_vram >= 6 * (1024 ** 3):
+            base_model, tokenizer = _load_cuda_model()
+    except Exception as error:
+        if _GENERATION_MODE == "cuda":
+            raise
+        logging.warning("CUDA 모델 초기화 실패. Ollama를 사용합니다: %s", type(error).__name__)
+        _LOADED_SUBJECT_ADAPTERS.clear()
+if _GENERATION_MODE == "cuda" and base_model is None:
+    raise RuntimeError("CUDA model was requested but CUDA is unavailable")
+
 
 app.state.model     = base_model
 app.state.tokenizer = tokenizer
@@ -150,16 +135,16 @@ app.state.writing_model     = base_model if LOAD_WRITING_ADAPTER else None
 app.state.writing_tokenizer = tokenizer
 
 # 개념 설명에 중국어·일본어 등 다른 문자가 섞이지 않게 해당 토큰을 막는다(script_guard.py).
-_FOREIGN_BLOCKER = ForeignScriptBlocker(foreign_token_mask(tokenizer, base_model.config.vocab_size))
+_FOREIGN_BLOCKER = None if base_model is None else ForeignScriptBlocker(foreign_token_mask(tokenizer, base_model.config.vocab_size))
 
 # 국어·사회는 설명에 영어가 나올 이유가 없어 한 단계 더 막는다("갈Conflict", "속belongs합니다"
 # 같은 사례가 있었다 — script_guard._LATIN 설명 참고). 수학(D, x)·과학(DNA, pH)·영어 과목은
 # 정상적으로 영문자가 필요해서 이 목록에 안 넣는다.
-_LATIN_BLOCKER = ForeignScriptBlocker(latin_token_mask(tokenizer, base_model.config.vocab_size))
+_LATIN_BLOCKER = None if base_model is None else ForeignScriptBlocker(latin_token_mask(tokenizer, base_model.config.vocab_size))
 _NO_LATIN_SUBJECTS = frozenset({"국어", "사회"})
 
 # 샘플링에서 "귥한", "줿게" 같은 깨진 한글 음절이 나와 전 과목에서 막는다(script_guard 설명 참고).
-_RARE_HANGUL_BLOCKER = RareHangulBlocker(tokenizer, base_model.config.vocab_size)
+_RARE_HANGUL_BLOCKER = None if base_model is None else RareHangulBlocker(tokenizer, base_model.config.vocab_size)
 
 
 def _script_blockers(subject: str | None) -> "LogitsProcessorList":
@@ -250,6 +235,8 @@ def _concept_explain(subject: str, concept_query: str,
     """
     import logging
 
+    if app.state.model is None:
+        return None
     if subject == "수학":
         adapter_name, system_prompt = None, MATH_SYSTEM_PROMPT
     elif subject in _CONCEPT_USE_BASE and subject in SUBJECT_ADAPTERS:
@@ -340,6 +327,8 @@ def _qwen_advice(prompt: str, subject: str | None = None) -> str | None:
     않는다. 프롬프트(질문+분량 지시)는 호출부(counseling.py)가 이미 만들어 그대로 받는다.
     """
     import logging
+    if base_model is None:
+        return None
     try:
         messages = [
             {"role": "system", "content": ADVICE_SYSTEM_PROMPT},
@@ -387,20 +376,22 @@ def _warm_up() -> None:
     import logging
     import time
     import httpx
-    from src.api.generation import OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_URL
+    from src.api.generation import OLLAMA_URL
 
     t = time.time()
+    if base_model is not None:
+        try:
+            ids = tokenizer("안녕하세요", return_tensors="pt").to("cuda")
+            with _GEN_LOCK, torch.no_grad(), base_model.disable_adapter():
+                base_model.generate(**ids, max_new_tokens=8, do_sample=False,
+                                    pad_token_id=tokenizer.eos_token_id)
+        except Exception as e:
+            logging.warning("[CUDA 예열] 실패: %s", type(e).__name__)
     try:
-        ids = tokenizer("안녕하세요", return_tensors="pt").to("cuda")
-        with _GEN_LOCK, torch.no_grad(), base_model.disable_adapter():
-            base_model.generate(**ids, max_new_tokens=8, do_sample=False,
-                                pad_token_id=tokenizer.eos_token_id)
-        # prompt 없이 보내면 생성 없이 모델만 올린다(Ollama API).
-        httpx.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "keep_alive": OLLAMA_KEEP_ALIVE},
-                   timeout=120)
-        print(f"🔥 예열 완료 ({time.time() - t:.1f}초)")
+        httpx.post(OLLAMA_URL, json=ollama_request(), timeout=30).raise_for_status()
+        print(f"🔥 모델 예열 완료 ({time.time() - t:.1f}초)")
     except Exception as e:
-        logging.warning(f"[예열] 실패 — 첫 요청이 느릴 수 있습니다: {e}")
+        logging.warning("[Ollama 예열] 실패: %s", type(e).__name__)
 
 
 @app.on_event("startup")
@@ -414,42 +405,43 @@ async def generate_subject_recommendation(
         subject: str = Query(...),
         concept_tag: str = Query(default=None),
 ):
-    if concept_tag:
-        concept_query = concept_tag
-    else:
-        weakness_data = get_student_weakness_from_java(student_id, subject)
-        concept_query = (
-            weakness_data[0].get("conceptTag")
-            if weakness_data else
-            _SUBJECT_DEFAULT_CONCEPT.get(subject, f"{subject} 기본 개념")
-        )
-
-    rag_docs = _subject_aware_search(subject, concept_query, k=3)
-    rag_text = "\n".join(f"  • {d}" for d in rag_docs if d and "오류" not in d)
+    observed = (concept_tag or "").strip()
+    if observed == f"{subject} 기본 개념":  # Java가 취약 태그 미등록 시 보내는 기본값
+        observed = ""
+    elif not observed:
+        weakness_data = await run_in_threadpool(get_student_weakness_from_java, student_id, subject)
+        observed = next(((row.get("conceptTag") or "").strip() for row in (weakness_data or [])
+                         if row and (row.get("conceptTag") or "").strip()), "")
+    concept_query = observed or _SUBJECT_DEFAULT_CONCEPT.get(subject, f"{subject} 기본 개념")
+    rag_docs = await run_in_threadpool(_subject_aware_search, subject, concept_query, k=3)
+    rag_text = _material_lines(rag_docs, observed)
 
     steps = _SUBJECT_STRATEGY.get(subject, [
         "개념 정리 및 확인", "관련 예제 풀이", "오답 분석", "추가 문제로 실력 확인"
     ])
     strategy = "\n".join(f"{i+1}단계 — {s}" for i, s in enumerate(steps))
 
-    report = f"[{subject} 취약 개념 학습 가이드]\n\n● 집중 학습 개념: {concept_query}\n"
+    if observed:
+        report = f"[{subject} 취약 개념 학습 가이드]\n\n● 집중 학습 개념: {concept_query}\n"
+    else:
+        report = f"[{subject} 복습 시작 가이드]\n\n개인별 취약 개념 기록이 없어 {concept_query}부터 안내합니다.\n"
     if rag_text:
         report += f"\n[관련 학습 자료]\n{rag_text}\n"
-    report += f"\n[학습 전략]\n{strategy}"
+    report += f"\n[학습 전략]\n{strategy}\n\n확인 활동: ‘{concept_query}’ 예제 하나를 골라 사용한 원리를 한 문장으로 설명하세요."
 
     # 베이스 Qwen으로 생성하고, _concept_explain()이 None을 주는 과목만 Ollama로 넘긴다.
     # GPU 생성은 수 초가 걸리는 블로킹 작업이라 threadpool로 빼서 이벤트 루프를 막지 않는다.
-    llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query, rag_docs)
+    llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query, rag_docs) if observed else None
     if llm_insight:
         fallback_stats.record("concept", "qwen")
 
-    if not llm_insight:
+    if observed and not llm_insight:
         prompt = (
             f"{context_block(rag_docs)}"
             f"{subject} 과목에서 '{concept_query}' 개념을 어려워하는 학생에게 "
             f"이 개념의 핵심 포인트와 효과적인 학습 방법을 2~3문장으로 한국어로 답해주세요."
         )
-        llm_insight = await _ollama_analyze(prompt)
+        llm_insight = await _report_ollama(prompt)
         fallback_stats.record("concept", "ollama" if llm_insight else "none")
 
     if llm_insight:

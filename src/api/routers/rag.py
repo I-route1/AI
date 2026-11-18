@@ -1,5 +1,6 @@
 import pickle
 import re
+from src.api.curriculum_text import extract_passage
 from pathlib import Path
 
 import faiss
@@ -169,41 +170,6 @@ _SUBJECT_KEYWORDS: dict[str, list[str]] = {
 }
 
 
-def _clean_text(text: str) -> str:
-    """LaTeX 수식·HTML·불필요한 특수문자 제거"""
-    text = re.sub(r'\$\$[\s\S]*?\$\$', '', text)
-    text = re.sub(r'\$[^$\n]{1,200}?\$', '', text)
-    text = re.sub(r'\\begin\{[^}]+\}[\s\S]*?\\end\{[^}]+\}', '', text)
-    text = re.sub(r'\\[a-zA-Z]+(?:\{[^}]*\})*', '', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'[{}\[\]\\^_|]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
-
-def _extract_content(doc: str) -> str:
-    """
-    RAG 문서에서 핵심 내용만 추출 — 폴더 경로·과정 코드 제거.
-    우선순위: 학습 지문 → Q&A 답변 → 성취기준 텍스트 → 전체 클리닝
-    """
-    # 학습 지문
-    m = re.search(r'\[학습 지문\]\s*(.+?)(?=\[|$)', doc, re.DOTALL)
-    if m:
-        return _clean_text(m.group(1).strip())
-
-    # Q&A 답변
-    m = re.search(r'답변[:\s]+(.+?)(?=\[|질문:|$)', doc, re.DOTALL)
-    if m:
-        return _clean_text(m.group(1).strip())
-
-    # 성취기준 설명 (코드 번호 제외)
-    m = re.search(r'\[교육과정 성취기준\]\s*\[[^\]]*\]\s*(.+?)(?=\[|$)', doc, re.DOTALL)
-    if m:
-        return _clean_text(m.group(1).strip())
-
-    return _clean_text(doc)
-
-
 _concept_vec_cache: dict[str, tuple[list[str], np.ndarray]] = {}
 
 
@@ -231,7 +197,7 @@ def _concept_map_semantic(subject: str, query: str, k: int) -> list[str]:
         order = np.argsort(-scores)[:k]
         return [entries[i] for i in order]
     except Exception:
-        return entries[:k]  # 임베딩 실패 시 기존 동작(앞에서 k개)으로 폴백
+        return []
 
 
 def _filter_by_subject(docs: list[str], subject: str) -> list[str]:
@@ -256,14 +222,14 @@ def _filter_by_subject(docs: list[str], subject: str) -> list[str]:
 def vector_search(query: str, k: int = 3) -> list[str]:
     """기존 검색 (과목 필터 없음 — /api/rag/search 에서 사용)"""
     if _index is None or not _doc_texts:
-        return ["검색 가능한 데이터가 없습니다."]
+        return []
     try:
         vec = _encode(query).astype(np.float32)
         faiss.normalize_L2(vec)
         _, indices = _index.search(vec, k)
         return [_doc_texts[i] for i in indices[0] if 0 <= i < len(_doc_texts)]
-    except Exception as e:
-        return [f"검색 오류: {str(e)}"]
+    except Exception:
+        return []
 
 
 def subject_aware_search(subject: str, query: str, k: int = 3) -> list[str]:
@@ -271,7 +237,7 @@ def subject_aware_search(subject: str, query: str, k: int = 3) -> list[str]:
     1. 개요 쿼리(핵심 개념 및 자주 출제되는 단원) → ConceptMap 과목 샘플 즉시 반환
     2. ConceptMap 키워드 직접 매핑 — 히트가 있으면 즉시 반환 (FAISS 혼합 없음)
     3. ConceptMap 미스 → FAISS 벡터 검색 + 과목 필터
-    4. FAISS도 결과 없으면 ConceptMap에서 해당 과목 샘플 반환 (fallback)
+    4. 구체적인 질의에 결과가 없으면 빈 목록 반환
     """
     # ── 1. 개요 쿼리 감지: 개념 없이 과목만 선택한 경우 ─────────────────────────
     if "핵심 개념 및 자주 출제되는 단원" in query:
@@ -326,7 +292,7 @@ def subject_aware_search(subject: str, query: str, k: int = 3) -> list[str]:
             cleaned = []
             seen = set()
             for doc in filtered:
-                c = _extract_content(doc)
+                c = extract_passage(doc)
                 if len(c) > 30 and c not in seen:
                     cleaned.append(c)
                     seen.add(c)
@@ -335,12 +301,10 @@ def subject_aware_search(subject: str, query: str, k: int = 3) -> list[str]:
 
             if cleaned:
                 return cleaned
-        except Exception as e:
-            return [f"검색 오류: {str(e)}"]
+        except Exception:
+            return []
 
-    # ── 3. ConceptMap 과목 샘플 (개념 미입력 등 완전 미스 시 fallback) ──────────
-    overview = [v for keys, v in _CONCEPT_MAP.items() if keys[0] == subject]
-    return overview[:k]
+    return []
 
 
 # ── POST /api/rag/search ───────────────────────────────────────────────────────
@@ -350,6 +314,13 @@ def detect_subject(query: str) -> str | None:
     ConceptMap 키워드에 걸리는 과목을 먼저 본다 — "관계대명사 what"처럼 과목 이름이 없는 질문이
     아래 과목 키워드 목록에는 안 걸려 과목 필터 없는 벡터 검색(초등 영어 문서)으로 떨어졌다.
     """
+    # 과목을 직접 지칭한 질문을 먼저 본다. "영어로 설명"처럼 답변 언어를
+    # 지정한 표현은 수학·과학 질문에도 쓰일 수 있다.
+    explicit = re.match(r'^\s*(수학|영어|과학|사회|국어)(?:\s*[:：]|\s+(?:시간|수업|시험|문제|문장)|에서(?:\s|$))', query)
+    if explicit:
+        return explicit.group(1)
+    if re.search(r'(?<![A-Za-z])(?:\d+\s*)?[xy]\s*[+\-−*/×÷]\s*\d+\s*=\s*[-−]?\d+(?![0-9A-Za-z])', query, re.I):
+        return "수학"
     for subject in _SUBJECT_KEYWORDS:
         if _concept_map_search(subject, query, 1):
             return subject
