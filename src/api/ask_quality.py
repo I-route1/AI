@@ -1,11 +1,13 @@
 """학생에게 표시할 답변과 자료 사용 여부를 서로 다른 필드로 생성한다."""
 import asyncio
+from difflib import SequenceMatcher
 import json
 import logging
 import re
 
 from src.api.generation import OLLAMA_CPU, OLLAMA_URL, ollama_request
 from src.api.grounding import usable_docs
+from src.api.concept_map import search_concept_map
 from src.api.postprocess import strip_chat_frame, strip_markdown
 
 
@@ -30,11 +32,52 @@ def missing_exercise(question: str) -> bool:
     return _EXERCISE_REFERENCE.fullmatch(question) is not None
 
 
+def availability_notice(question: str) -> str | None:
+    """Inventory/seat availability is external live data. Given quantities still go to the tutor."""
+    if not re.search(r"지금|현재|실시간|방금|우리\s*동네|근처", question):
+        return None
+    if not re.search(r"매장|점포|편의점|가게|마트|영화관|열차|공연", question):
+        return None
+    if (re.search(r"\d|만약|가정|비율|확률|계산|왜|원리|방법|어떻게|일\s*때|다면|라면", question)
+            or not re.search(r"몇|얼마|있나요|있을까|남았|알려", question)):
+        return None
+    if "재고" in question:
+        return "현재 재고는 해당 매장에 문의하거나 매장 앱에서 확인해 주세요."
+    if re.search(r"잔여\s*좌석|남은\s*(?:좌석|자리)", question):
+        return "현재 남은 좌석은 해당 예매처의 좌석 현황에서 확인해 주세요."
+    return None
+
+
 def question_prompt(subject: str, question: str, docs: list[str]) -> tuple[str, bool]:
     references = usable_docs(docs)
     notes = "\n".join(references)
     prompt = f"과목: {subject}\n참고 자료: {notes or '없음'}\n\n학생 질문: {question}"
     return prompt, bool(references)
+
+
+def verify_reported_claim(subject: str, question: str, answer: str) -> tuple[str, bool]:
+    """Include the curriculum definition when a student asks whether a claim they heard is true."""
+    if not re.search(r"라고\s*들었|다고\s*들었|라던데|다던데|라는\s*말이\s*(?:맞|사실)", question):
+        return answer, False
+    notes = search_concept_map(subject, question, 1)
+    if not notes:
+        return answer, False
+    # Use a complete short definition from a direct keyword match. Long lists,
+    # fragments, and loosely related semantic search hits are poor citations.
+    first = re.match(r"^([^\n]{4,140}?[가-힣]\.(?=\s|$))", notes[0])
+    if not first:
+        return answer, False
+    definition = first.group(1)
+    lines = answer.splitlines()
+    if len(lines) == 2:
+        compact = [re.sub(r"[\s.,'’‘!?]+", "", line).casefold() for line in lines]
+        symbols = r"[\dA-Za-z+=<>−/-]+|아니|않|없|못"
+        if (re.findall(symbols, compact[0]) == re.findall(symbols, compact[1])
+                and SequenceMatcher(None, *compact).ratio() >= .88):
+            answer = lines[0]
+    if definition not in answer:
+        answer += "\n교과 자료 · " + definition
+    return answer, True
 
 
 _SYSTEM = (
@@ -51,6 +94,8 @@ def tutor_instruction(subject: str) -> str:
     if subject == "국어":
         return (_SYSTEM + " 예문의 표현을 자료에 나온 각 표현법의 구분 기준과 대조해 정확한 이름을 씁니다. "
                 "한글 음절 블록 하나는 한 글자이며 자모 수와 구분합니다.")
+    if subject == "과학":
+        return _SYSTEM + " 전제가 틀렸으면 올바른 명칭과 관계를 먼저 밝히고, 그 사실로 관찰 결과를 설명합니다."
     return _SYSTEM
 
 

@@ -8,6 +8,24 @@ from src.api.linear_equation import solve_linear
 
 
 class AskQualityTest(unittest.TestCase):
+    def test_reported_claim_adds_a_matching_definition(self):
+        from src.api.ask_quality import verify_reported_claim
+        text, cited = verify_reported_claim("과학", "초승달은 빛을 낸다고 들었는데 사실인가요?", "햇빛을 반사합니다.")
+        self.assertTrue(cited)
+        self.assertIn("자연 위성", text)
+        self.assertIn("햇빛을 반사", text)
+        self.assertEqual(verify_reported_claim("과학", "관련 자료를 찾아줘.", "일반 설명."),
+                         ("일반 설명.", False))
+
+    def test_live_availability_and_quantitative_examples(self):
+        from src.api.ask_quality import availability_notice
+        self.assertIn("예매처", availability_notice("지금 열차의 잔여 좌석이 몇 개 있나요?"))
+        self.assertIn("매장", availability_notice("우리 동네 편의점 재고가 얼마 남았나요?"))
+        for q in ("매장에서 현재 재고가 8개인데 3개를 사면 몇 개 남나요?",
+                  "지금 매장에서 재고를 줄인다면 수요는 어떻게 달라지나요?",
+                  "4번 문제. 지금 편의점에서 800원짜리 지우개 4개를 사면?"):
+            self.assertIsNone(availability_notice(q))
+
     def test_worked_equation_keeps_exact_intermediate_step(self):
         solution = solve_linear("4번 문제: 3x + 1 = 10일 때 x와 풀이를 알려 주세요.")
         self.assertTrue(solution.startswith("x = 3\n"))

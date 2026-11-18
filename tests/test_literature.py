@@ -6,12 +6,13 @@ from src.api.literature import classify_quoted_figure
 
 class QuotedFigureTest(unittest.TestCase):
     def classify(self, question, only=False):
-        return classify_quoted_figure(question, search_concept_map("국어", "비유법", 1), only)
+        return classify_quoted_figure(question, search_concept_map("국어", question, 3), only)
 
     def test_applies_curriculum_to_the_quoted_words(self):
         result = self.classify("‘단풍은 불꽃처럼 붉다.’에서 비유법의 이름과 그 근거는?")
         self.assertIn("직유법", result)
         self.assertIn("불꽃처럼", result)
+        self.assertIn("직유법", self.classify("‘단풍은 불꽃처럼 붉다.’는 어떤 비유법인가요?"))
         self.assertEqual(self.classify("‘시간은 강물이다.’에서 흐름을 나타낸 비유법의 이름은?", True), "은유법입니다.")
 
     def test_defers_other_tasks_and_literal_sentences(self):

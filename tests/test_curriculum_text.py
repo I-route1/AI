@@ -1,9 +1,18 @@
 import unittest
 
 from src.api.curriculum_text import extract_passage
+from src.api.concept_map import _kw_matches, search_concept_map
 
 
 class CurriculumTextTests(unittest.TestCase):
+    def test_spoken_question_endings_keep_whole_curriculum_terms(self):
+        for subject, term, ending in [("영어", "수동태", "인가요"), ("과학", "광합성", "일까요"),
+                                      ("국어", "비유법", "인지")]:
+            self.assertEqual(search_concept_map(subject, term + ending + "?", 1),
+                             search_concept_map(subject, term, 1))
+            self.assertTrue(search_concept_map(subject, term, 1))
+        self.assertFalse(_kw_matches("수열", "등비수열인가요?"))
+
     def test_math_contents_are_kept_in_the_passage(self):
         passage = r"구간 [0, 1]에서 $f(x)=\frac{x^2}{2}$이다. 0 < x < 1이면 |x| = x이다."
         document = f"[교육과정 성취기준] [A1] 함수\n[학습 지문] {passage}\n[관련 Q&A] 질문: 값은?"

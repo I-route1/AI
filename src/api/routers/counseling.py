@@ -4,7 +4,7 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from src.api.ask_quality import missing_exercise, ollama_answer, question_prompt, read_answer, tutor_instruction, wants_answer_only
+from src.api.ask_quality import availability_notice, missing_exercise, ollama_answer, question_prompt, read_answer, tutor_instruction, verify_reported_claim, wants_answer_only
 from src.api.linear_equation import solve_linear
 from src.api.literature import classify_quoted_figure
 from src.api import fallback_stats, model_registry
@@ -497,6 +497,9 @@ async def ai_ask(req: dict):
         subject = subject.strip() or None
     if subject is not None and subject not in _SUBJECT_KEYWORDS:
         raise HTTPException(status_code=400, detail=f"지원하지 않는 과목입니다: {subject}")
+    if notice := availability_notice(question):
+        return {"subject": subject, "question": question, "answer": notice, "grounded": False,
+                "needSubject": False, "answerKind": "out_of_scope"}
     subject = subject or detect_subject(question)
     if subject is None:
         return {"subject": None, "question": question, "answer": None, "grounded": False,
@@ -533,5 +536,8 @@ async def ai_ask(req: dict):
     if not answer:
         answer, grounded, kind = await ollama_answer(subject, prompt, has_reference, answer_only)
         fallback_stats.record("ask", "ollama" if answer else "none")
+    if answer and kind == "answer" and not answer_only:
+        answer, cited = verify_reported_claim(subject, question, answer)
+        grounded = grounded or cited
     return {"subject": subject, "question": question, "answer": answer, "grounded": grounded,
             "needSubject": False, "answerKind": kind}
