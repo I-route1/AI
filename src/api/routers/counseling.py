@@ -2,12 +2,16 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
+from src.api.ask_quality import missing_exercise, ollama_answer, question_prompt, read_answer, tutor_instruction, wants_answer_only
+from src.api.linear_equation import solve_linear
+from src.api.literature import classify_quoted_figure
 from src.api import fallback_stats, model_registry
 from src.api.concept_map import search_concept_map
-from src.api.generation import OLLAMA_KEEP_ALIVE, OLLAMA_MODEL, OLLAMA_OPTIONS, OLLAMA_URL
+from src.api.generation import OLLAMA_CPU, OLLAMA_URL, ollama_request
 from src.api.java_client import get_student_weakness_from_java
-from src.api.grounding import context_block, is_curated, question_user_message, usable_docs
+from src.api.grounding import context_block, is_curated
 from src.api.postprocess import strip_markdown
+from src.api.report_text import complete_generation, material_excerpt, positive_measurement
 from src.api.script_guard import has_foreign, strip_foreign
 from src.api.routers.rag import detect_subject, subject_aware_search, vector_search, _SUBJECT_KEYWORDS
 
@@ -41,21 +45,26 @@ _STRATEGY = {
 }
 
 
-async def _ollama_once(client: httpx.AsyncClient, prompt: str, timeout: float) -> str | None:
+async def _ollama_once(client: httpx.AsyncClient, prompt: str, timeout: float,
+                       max_tokens: int | None) -> str | None:
     import logging
     r = await client.post(
         OLLAMA_URL,
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": OLLAMA_OPTIONS,
-              "keep_alive": OLLAMA_KEEP_ALIVE},
+        json=ollama_request(prompt, max_tokens=max_tokens),
         timeout=timeout,
     )
     if r.status_code == 200:
-        return r.json().get("response", "").strip()
+        payload = r.json()
+        result = (payload.get("response") or "").strip()
+        if payload.get("done_reason") == "length":
+            return complete_generation(result) or None
+        return result
     logging.warning(f"[Ollama] status {r.status_code}: {r.text[:200]}")
     return None
 
 
-async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
+async def _ollama_analyze(prompt: str, timeout: float = 20.0, *,
+                          max_tokens: int | None = None, retry_foreign: bool = True) -> str | None:
     """Ollama llama3.1으로 짧은 분석 생성. 실패/타임아웃 시 None 반환.
 
     main.py의 개념 설명 폴백도 이 함수를 쓴다(예전엔 두 파일에 같은 함수가 따로 있었다).
@@ -65,15 +74,26 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0) -> str | None:
     import logging
     try:
         async with httpx.AsyncClient() as client:
-            text = await _ollama_once(client, prompt, timeout)
+            text = await _ollama_once(client, prompt, timeout, max_tokens)
             if text and has_foreign(text):
-                retry = await _ollama_once(client, prompt, timeout)
+                retry = await _ollama_once(client, prompt, timeout, max_tokens) if retry_foreign else None
                 text = retry if retry and not has_foreign(retry) else strip_foreign(retry or text).strip()
             # Qwen 개념 설명과 같은 정리 — 리포트에 "**굵게**" 기호가 그대로 보였다.
             return strip_markdown(text) if text else text
     except Exception as e:
         logging.warning(f"[Ollama] 연결 실패: {e}")
     return None
+
+
+async def _report_ollama(prompt: str) -> str | None:
+    if not OLLAMA_CPU:
+        return await _ollama_analyze(prompt)
+    # CPU에서 기존 400토큰 요청은 대개 20초 제한을 넘겼다. Java의 50초 한도 안에
+    # 한 번만 요청하고, 교과 근거와 다음 학습 행동 하나에 집중한다.
+    return await _ollama_analyze(
+        prompt + "\n한국어로 두 문장 이내로 쓰세요. 첫 문장에 핵심, 다음 문장에 직접 해 볼 활동 하나를 담으세요.",
+        timeout=35.0, max_tokens=106, retry_foreign=False,
+    )
 
 
 async def _advice(prompt: str, subject: str | None = None) -> str | None:
@@ -89,7 +109,7 @@ async def _advice(prompt: str, subject: str | None = None) -> str | None:
         if result:
             fallback_stats.record("advice", "qwen")
             return result
-    result = await _ollama_analyze(prompt)
+    result = await _report_ollama(prompt)
     fallback_stats.record("advice", "ollama" if result else "none")
     return result
 
@@ -102,28 +122,28 @@ def _level_label(percentile: float) -> str:
     return "기초 학습 필요"
 
 
-def _level_basis(subject: str, req: dict) -> tuple[float, str]:
-    """(수준 판정에 쓸 백분위, 리포트에 적을 근거 문구).
-
-    그 과목 최근 시험 백분위(Backend subjectPercentile) → 국어 백분위(currentKoreanGrade) 순으로 쓰고
-    어느 것을 썼는지 문구에 밝힌다. 예전에는 영어·과학 리포트도 국어 백분위를 "백분위"라고만
-    적었다. 둘 다 없으면(Backend는 없을 때 0을 보낸다) 판정은 중위권(50) 기준으로 하되
-    "성적 정보 없음"이라고 쓴다 — 예전에는 기본값 50을 "백분위 50%"로 적어 실제 성적처럼 보였다.
-    """
-    sp = req.get("subjectPercentile")
-    if isinstance(sp, (int, float)) and sp > 0:
-        return float(sp), f"{subject} 백분위 {sp:.0f}%"
-    kg = float(req.get("currentKoreanGrade") or 0)
-    if kg > 0:
-        return kg, f"국어 백분위 {kg:.0f}%"
-    return 50.0, "성적 정보 없음"
+def _level_basis(subject: str, req: dict) -> tuple[float | None, str]:
+    """Backend는 미등록 국어 백분위를 0으로 보낸다. 대체 교과는 항상 표시한다."""
+    measured = positive_measurement(req.get("subjectPercentile"), 100)
+    if measured is not None:
+        return measured, f"{subject} 백분위 {measured:g}%"
+    korean = positive_measurement(req.get("currentKoreanGrade"), 100)
+    if korean is not None:
+        if subject == "국어":
+            return korean, f"국어 백분위 {korean:g}%"
+        return None, f"{subject} 백분위 미등록 (참고용 국어 백분위 {korean:g}%)"
+    return None, "성적 정보 없음"
 
 
-def _study_intensity(hours: float) -> str:
-    if hours >= 3: return "충분한 학습량"
-    if hours >= 2: return "적정 학습량"
-    if hours >= 1: return "학습량 보강 필요"
-    return "학습량 매우 부족"
+def _study_time(req: dict) -> str:
+    hours = positive_measurement(req.get("studyTime"), 24)
+    return f"일 {hours:g}시간" if hours is not None else "학습 시간 기록 없음"
+
+
+def _grade_description(percentile: float | None, basis: str) -> str:
+    if percentile is None:
+        return basis
+    return f"{_level_label(percentile)} ({basis})"
 
 
 def _resolve_concept(subject: str, req: dict) -> str:
@@ -154,12 +174,18 @@ def _resolve_concept(subject: str, req: dict) -> str:
     return ""
 
 
-def _material_lines(docs: list[str], concept: str, width: int = 120) -> str:
+def _material_lines(docs: list[str], concept: str, width: int = 420) -> str:
     """리포트의 '관련 학습 자료' 줄. 개념을 특정하지 못해 기본 검색어로 찾은 경우에는
     ConceptMap 자료만 보여 준다 — FAISS 교과서 조각은 "Use the phrases from the
     vocabulary list." 같은 문장이라 학생에게 의미가 없다."""
-    keep = [d for d in docs if d and "오류" not in d and (concept or is_curated(d))]
-    return "\n".join(f"  • {d[:width]}" for d in keep)
+    notes = []
+    for doc in docs:
+        if not doc or doc.startswith(("검색 오류", "검색 실패")) or not (concept or is_curated(doc)):
+            continue
+        excerpt = material_excerpt(doc, width)
+        if excerpt and excerpt not in notes:
+            notes.append(excerpt)
+    return "\n".join(f"  • {note}" for note in notes)
 
 
 # writing·premium의 학습 조언 프롬프트 공통 지시. 예전 프롬프트는 질문을 되풀이하며 시작해
@@ -181,118 +207,62 @@ def _direction_line(req: dict, concept: str) -> str:
 
 
 def _math_report(req: dict, concept: str) -> tuple[dict, list[str]]:
-    """(리포트, 검색한 RAG 자료). 자료는 LLM 문단의 근거로 다시 쓴다.
-    concept은 _resolve_concept()로 정한 취약 개념(없으면 빈 문자열)."""
-    student_id     = req.get("studentId", "")
-    percentile, basis = _level_basis("수학", req)
-    study_hours    = float(req.get("studyTime") or 1)
-    student_note   = req.get("studentNote") or ""
-    feedback       = req.get("instructorFeedback") or ""
-
-    level   = _level_label(percentile)
-    stamina = _study_intensity(study_hours)
-
-    # RAG로 수학 취약 개념 관련 학습 자료 검색 (과목 필터 적용)
-    rag_docs  = subject_aware_search("수학", concept or "방정식 함수 기본 개념", k=3)
-    rag_text  = _material_lines(rag_docs, concept)
-
-    career_analysis = (
-        f"[수학 사고력 및 오답 패턴 분석]\n\n"
-        f"● 현재 학업 수준: {level} ({basis})\n"
-        f"● 학습 강도: {stamina} (일 {study_hours:.1f}시간)\n"
-    )
-    career_analysis += _direction_line(req, concept)
-    if student_note:
-        career_analysis += f"● 학습 특성: {student_note}\n"
-    if feedback:
-        career_analysis += f"● 최근 강사 피드백: {feedback}\n"
-    if concept:
-        career_analysis += f"\n[취약 개념 집중 분석]\n{concept}\n"
-    if rag_text:
-        career_analysis += f"\n[관련 학습 자료 검색 결과]\n{rag_text}\n"
-
-    learning_guide = (
-        f"[수학 맞춤 학습 전략]\n\n"
-        f"1단계 — 오답 유형 분류: 계산 실수 / 개념 미이해 / 응용력 부족으로 구분 후 원인별 대응\n"
-        f"2단계 — 취약 개념 집중: '{concept or '핵심 공식'}' 단원 기출 10문항 반복\n"
-        f"3단계 — 오답 노트 작성: 틀린 문제를 다시 풀어 풀이 과정을 직접 설명\n"
-        f"4단계 — 실력 점검: 단원 마무리 후 실전 모의고사로 확인\n\n"
-        f"현재 {level} 기준 권장 일일 학습: "
-        f"{'수학 1.5시간 + 오답 정리 30분' if percentile >= 75 else '개념 1시간 + 문제풀이 1시간 + 복습 30분'}"
-    )
-
-    # math 어댑터는 문제 풀이 특화 파인튜닝으로 학습 조언 프롬프트에 부적합 — LLM 미사용
-
-    return {
-        "studentId": student_id,
-        "title": "수학 메타인지 분석 리포트",
-        "careerAnalysis": career_analysis,
-        "learningGuide": learning_guide,
-    }, rag_docs
+    return _subject_report("수학", req, concept)
 
 
 def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[str]]:
-    """전 과목 공용 메타인지 분석 리포트 (수학 리포트와 동일한 형식을 과목별로 일반화).
-    (리포트, 검색한 RAG 자료)를 돌려준다. 자료는 LLM 문단의 근거로 다시 쓴다.
-    concept은 _resolve_concept()로 정한 취약 개념(없으면 빈 문자열)."""
-    student_id     = req.get("studentId", "")
     percentile, basis = _level_basis(subject, req)
-    study_hours    = float(req.get("studyTime") or 1)
-    student_note   = req.get("studentNote") or ""
-    feedback       = req.get("instructorFeedback") or ""
-
-    level   = _level_label(percentile)
-    stamina = _study_intensity(study_hours)
-    tier    = "high" if percentile >= 75 else "mid" if percentile >= 50 else "low"
-
-    rag_docs = subject_aware_search(subject, concept or _DEFAULT_QUERY.get(subject, subject), k=3)
+    rag_docs = subject_aware_search(subject, concept or _DEFAULT_QUERY[subject], k=3)
     rag_text = _material_lines(rag_docs, concept)
-
-    career_analysis = (
+    analysis = (
         f"[{subject} 사고력 및 오답 패턴 분석]\n\n"
-        f"● 현재 학업 수준: {level} ({basis})\n"
-        f"● 학습 강도: {stamina} (일 {study_hours:.1f}시간)\n"
+        f"● 현재 학업 수준: {_grade_description(percentile, basis)}\n"
+        f"● 기록된 학습 시간: {_study_time(req)}\n"
     )
-    career_analysis += _direction_line(req, concept)
-    if student_note:
-        career_analysis += f"● 학습 특성: {student_note}\n"
-    if feedback:
-        career_analysis += f"● 최근 강사 피드백: {feedback}\n"
+    analysis += _direction_line(req, concept)
+    if note := req.get("studentNote"):
+        analysis += f"● 학습 특성: {note}\n"
+    if feedback := req.get("instructorFeedback"):
+        analysis += f"● 최근 강사 피드백: {feedback}\n"
     if concept:
-        career_analysis += f"\n[취약 개념 집중 분석]\n{concept}\n"
+        analysis += f"\n[취약 개념 집중 분석]\n{concept}\n"
     if rag_text:
-        career_analysis += f"\n[관련 학습 자료 검색 결과]\n{rag_text}\n"
+        analysis += f"\n[관련 학습 자료 검색 결과]\n{rag_text}\n"
 
-    mistake_types = _MISTAKE_TYPES.get(subject, "개념 미이해 / 적용력 부족 / 실수")
-    strategy      = _STRATEGY.get(subject, {}).get(tier, "기본 개념 정리 후 문제풀이 반복")
-
-    learning_guide = (
+    hours = positive_measurement(req.get("studyTime"), 24)
+    target = f"‘{concept}’" if concept else "최근 배운 단원"
+    practice = f"{target}의 예제 한 문제를 풀고, 답을 고른 근거를 한 문장으로 적어 보세요."
+    if percentile is None:
+        check = "다음 시험 성적을 등록한 뒤 이번에 어려웠던 개념을 다시 확인하세요."
+    else:
+        tier = "high" if percentile >= 75 else "mid" if percentile >= 50 else "low"
+        check = _STRATEGY[subject][tier]
+    guide = (
         f"[{subject} 맞춤 학습 전략]\n\n"
-        f"1단계 — 오답 유형 분류: {mistake_types}로 구분 후 원인별 대응\n"
-        f"2단계 — 취약 개념 집중: '{concept or '핵심 개념'}' 단원 기출 10문항 반복\n"
-        f"3단계 — 오답 노트 작성: 틀린 문제를 다시 풀어 풀이 과정을 직접 설명\n"
-        f"4단계 — 실력 점검: {strategy}\n\n"
-        f"현재 {level} 기준 권장 일일 학습: "
-        f"{f'{subject} 1.5시간 + 오답 정리 30분' if tier == 'high' else '개념 1시간 + 문제풀이 1시간 + 복습 30분'}"
+        f"1단계 — 교과서나 관련 자료를 읽고 {target}의 핵심을 자신의 말로 정리하세요.\n"
+        f"2단계 — {practice}\n"
+        f"3단계 — 오답의 원인을 다음 항목과 비교하세요. {_MISTAKE_TYPES[subject]}.\n"
+        f"4단계 — 다음 학습에서 점검할 내용: {check}\n"
     )
-
+    if hours is not None:
+        minutes = round(hours * 60)
+        if minutes >= 2:
+            session = min(20, minutes)
+            guide += f"\n다음 복습 예시: 기록된 하루 {minutes}분 중 {session}분을 이 활동에 사용해 보세요."
     return {
-        "studentId": student_id,
+        "studentId": req.get("studentId", ""),
         "title": f"{subject} 메타인지 분석 리포트",
-        "careerAnalysis": career_analysis,
-        "learningGuide": learning_guide,
+        "careerAnalysis": analysis,
+        "learningGuide": guide,
     }, rag_docs
 
 
 def _writing_report(req: dict, concept: str) -> dict:
     student_id    = req.get("studentId", "")
     percentile, basis = _level_basis("국어", req)
-    study_hours   = float(req.get("studyTime") or 1)
     student_note  = req.get("studentNote") or ""
     recommend_ctx = req.get("recommendContext") or ""
     feedback      = req.get("instructorFeedback") or ""
-
-    level = _level_label(percentile)
 
     # RAG로 국어 관련 학습 자료 검색 (과목 필터 적용). recommendContext는 보통 수준 라벨이라
     # 검색어로 쓰지 않고 _resolve_concept()로 정한 개념을 쓴다.
@@ -301,31 +271,31 @@ def _writing_report(req: dict, concept: str) -> dict:
 
     career_analysis = (
         f"[언어·작문 역량 및 진로 적합성 분석]\n\n"
-        f"● 국어 학업 수준: {level} ({basis})\n"
-        f"● 일일 학습 시간: {study_hours:.1f}시간\n"
+        f"● 국어 학업 수준: {_grade_description(percentile, basis)}\n"
+        f"● 기록된 학습 시간: {_study_time(req)}\n"
     )
     if student_note:
         career_analysis += f"● 학습 성향 및 특성: {student_note}\n"
     if feedback:
         career_analysis += f"● 강사 관찰 소견: {feedback}\n"
     if recommend_ctx:
-        career_analysis += f"\n[진로 추천 근거]\n{recommend_ctx}\n"
+        career_analysis += f"\n[학습 방향]\n{recommend_ctx}\n"
     if rag_text:
         career_analysis += f"\n[관련 학습 자료 검색 결과]\n{rag_text}\n"
 
-    if percentile >= 80:
-        career_path = "언어·미디어 계열 (기자, 작가, 출판 편집자, 광고 카피라이터)"
+    if percentile is None:
+        guide_focus = "짧은 지문에서 글쓴이의 주장과 근거를 찾아 현재 독해 수준 확인"
+    elif percentile >= 80:
         guide_focus = "심화 독해 + 논술 + 다양한 장르 글쓰기 경험"
     elif percentile >= 60:
-        career_path = "교육·상담·사회복지 계열"
         guide_focus = "비문학 독해 강화 + 핵심 주장 파악 훈련"
     else:
-        career_path = "실용 언어 능력을 바탕으로 한 서비스·유통 계열"
         guide_focus = "어휘력 확장 + 단문 요약 훈련부터 시작"
 
     learning_guide = (
         f"[진로 맞춤 언어 학습 전략]\n\n"
-        f"● 추천 진로 계열: {career_path}\n\n"
+        "● 진로 탐색 활동: 관심 있는 주제를 하나 골라 짧은 기사나 설명문을 써 보세요. "
+        "자료 조사, 인터뷰, 문장 다듬기 중 어떤 과정이 재미있었는지 기록하세요.\n\n"
         f"● 핵심 역량 강화 방향: {guide_focus}\n\n"
         f"주간 학습 계획:\n"
         f"  - 월·수·금: 비문학 지문 1편 정독 + 핵심어 3개 추출\n"
@@ -354,87 +324,46 @@ def _premium_subject(req: dict) -> str:
 
 
 def _premium_report(req: dict, concept: str) -> dict:
-    student_id    = req.get("studentId", "")
-    percentile, basis = _level_basis(_premium_subject(req), req)
-    study_hours   = float(req.get("studyTime") or 1)
-    student_note  = req.get("studentNote") or ""
-    recommend_ctx = req.get("recommendContext") or ""
-    feedback      = req.get("instructorFeedback") or ""
-
-    level   = _level_label(percentile)
-    stamina = _study_intensity(study_hours)
-
-    # 프리미엄 리포트: 주 취약 과목 기준으로 RAG 검색
-    rag_docs  = subject_aware_search(_premium_subject(req), concept or "기본 개념", k=4)
-    rag_text  = _material_lines(rag_docs, concept, 130)
-
-    career_analysis = (
-        f"[i-Route 프리미엄 종합 학습 진단]\n\n"
-        f"━━ 학업 현황 ━━\n"
-        f"● 학업 수준: {level} ({basis})\n"
-        f"● 학습 강도: {stamina} (일 {study_hours:.1f}시간)\n"
+    subject = _premium_subject(req)
+    percentile, basis = _level_basis(subject, req)
+    analysis = (
+        "[i-Route 프리미엄 종합 학습 진단]\n\n"
+        f"● 학업 수준: {_grade_description(percentile, basis)}\n"
+        f"● 기록된 학습 시간: {_study_time(req)}\n"
     )
-    if student_note:
-        career_analysis += f"● 학습 특성: {student_note}\n"
-    if feedback:
-        career_analysis += f"● 강사 종합 평가: {feedback}\n"
-    if recommend_ctx and recommend_ctx != concept:
-        career_analysis += f"● 학습 방향: {recommend_ctx}\n"
+    if note := req.get("studentNote"):
+        analysis += f"● 학습 특성: {note}\n"
+    if feedback := req.get("instructorFeedback"):
+        analysis += f"● 최근 강사 피드백: {feedback}\n"
+    analysis += _direction_line(req, concept)
     if concept:
-        career_analysis += f"\n━━ 취약 영역 집중 진단 ━━\n{concept}\n"
-    if rag_text:
-        career_analysis += f"\n━━ RAG 기반 연관 학습 데이터 ━━\n{rag_text}\n"
+        analysis += f"\n[취약 영역 집중 진단]\n{subject} · {concept}\n"
+        docs = subject_aware_search(subject, concept, k=3)
+        if material := _material_lines(docs, concept):
+            analysis += f"\n[관련 학습 자료]\n{material}\n"
 
-    if percentile >= 85:
-        strategy = (
-            "최상위권 유지 전략: 실수 제로화에 집중하세요.\n"
-            "  - 수학: 킬러문항 집중 훈련, 시간 단축 연습\n"
-            "  - 영어: 고난도 빈칸·순서 유형 반복\n"
-            "  - 국어: 고전 문학 + 현대소설 심층 독해"
-        )
-    elif percentile >= 60:
-        strategy = (
-            "상승 도약 전략: 취약 단원을 집중 공략하세요.\n"
-            "  - 수학: 오답 유형 분류 후 유형별 집중 풀이\n"
-            "  - 영어: 구문 독해 → 유형별 문제풀이 순서로\n"
-            "  - 국어: 비문학 지문 구조 파악 훈련"
-        )
-    else:
-        strategy = (
-            "기초 강화 전략: 개념 이해를 최우선으로 하세요.\n"
-            "  - 수학: 교과서 개념부터 순서대로 재정리\n"
-            "  - 영어: 핵심 문법 5개 + 단어 20개/일 암기\n"
-            "  - 국어: 짧은 지문 요약 훈련으로 독해력 향상"
-        )
-
-    learning_guide = (
+    focus = f"{subject} ‘{concept}’" if concept else "복습할 단원 한 가지"
+    strategy = (
         f"[프리미엄 맞춤 전략 리포트]\n\n"
-        f"{strategy}\n\n"
-        f"━━ 주간 학습 로드맵 ━━\n"
-        f"  월: 수학 오답 노트 정리 + 취약 유형 5문항\n"
-        f"  화: 영어 구문 독해 1지문 + 어휘 정리\n"
-        f"  수: 국어 비문학 1지문 + 선지 분석\n"
-        f"  목: 수학 심화 문제 + 강사 피드백 반영\n"
-        f"  금: 3과목 약점 점검 미니 테스트\n"
-        f"  주말: 전 주 복습 + 다음 주 예습 30분씩\n\n"
-        f"━━ 목표 설정 ━━\n"
-        + (f"  현재 {percentile:.0f}% → "
-           f"{'99% 목표: 실수 0건' if percentile >= 85 else f'{min(100, percentile+15):.0f}% 목표: 취약 단원 집중 공략'}"
-           if basis != "성적 정보 없음" else "  성적을 등록하면 목표 백분위를 계산합니다")
+        f"이번 주에는 {focus}에 집중하세요.\n"
+        "첫날 — 교과서 예제 한 문제를 풀고 어떤 개념을 썼는지 적으세요.\n"
+        "다음 학습일 — 답안을 가리고 같은 원리를 쓰는 다른 문제를 풀어 보세요.\n"
+        "주말 — 두 풀이를 비교하고, 혼자 설명하기 어려운 단계 하나를 강사에게 질문하세요.\n"
     )
-
+    if feedback:
+        strategy += "\n강사 피드백에서 요청한 내용을 풀이 옆에 표시하고 다음 수업에서 확인하세요."
     return {
-        "studentId": student_id,
+        "studentId": req.get("studentId", ""),
         "title": "i-Route 프리미엄 통합 AI 진단 리포트",
-        "careerAnalysis": career_analysis,
-        "learningGuide": learning_guide,
+        "careerAnalysis": analysis,
+        "learningGuide": strategy,
     }
 
 
 @router.post("/report/math")
 async def report_math(req: dict):
     concept = await run_in_threadpool(_resolve_concept, "수학", req)
-    result, rag_docs = _math_report(req, concept)
+    result, rag_docs = await run_in_threadpool(_math_report, req, concept)
     if concept:
         prompt = (
             f"{context_block(rag_docs)}"
@@ -451,12 +380,11 @@ async def report_math(req: dict):
 @router.post("/report/writing")
 async def report_writing(req: dict):
     concept = await run_in_threadpool(_resolve_concept, "국어", req)
-    result = _writing_report(req, concept)
-    note = req.get("studentNote", "").strip()
+    result = await run_in_threadpool(_writing_report, req, concept)
+    note = (req.get("studentNote") or "").strip()
     _, basis = _level_basis("국어", req)
-    hours = float(req.get("studyTime") or 1)
     prompt = (
-        f"{basis}, 하루 공부 시간 {hours:.0f}시간인 학생입니다. "
+        f"성적 정보: {basis}. 학습 시간: {_study_time(req)}. "
         f"학생 특성: '{note or '특이사항 없음'}'.{_feedback_clause(req)} "
         f"이 학생의 국어(문학·비문학·작문) 실력을 올릴 구체적인 공부 방법 2가지를{_ADVICE_RULES}"
     )
@@ -469,14 +397,13 @@ async def report_writing(req: dict):
 @router.post("/report/premium")
 async def report_premium(req: dict):
     concept = await run_in_threadpool(_resolve_concept, _premium_subject(req), req)
-    result = _premium_report(req, concept)
+    result = await run_in_threadpool(_premium_report, req, concept)
     label = (req.get("recommendContext") or "").strip()
     _, basis = _level_basis(_premium_subject(req), req)
-    note = req.get("studentNote", "").strip()
-    hours = float(req.get("studyTime") or 1)
+    note = (req.get("studentNote") or "").strip()
     direction = f"학습 방향: '{label}', " if label and label != concept else ""
     prompt = (
-        f"학생 정보 — {basis}, 하루 공부 {hours:.0f}시간, {direction}"
+        f"학생 정보 — {basis}, 학습 시간: {_study_time(req)}. {direction}"
         f"취약 개념: '{concept or '특정되지 않음'}', 특성: '{note or '없음'}'.{_feedback_clause(req)} "
         f"이 학생이 성적을 올리려면 이번 주에 가장 먼저 해야 할 행동 2가지를{_ADVICE_RULES}"
     )
@@ -494,7 +421,7 @@ async def report_subject(subject: str, req: dict):
         raise HTTPException(status_code=404, detail=f"지원하지 않는 과목입니다: {subject}")
 
     concept = await run_in_threadpool(_resolve_concept, subject, req)
-    result, rag_docs = _subject_report(subject, req, concept)
+    result, rag_docs = await run_in_threadpool(_subject_report, subject, req, concept)
     if concept:
         # 1순위: main.py의 _concept_explain()(베이스 Qwen). main.py가 registry에 등록한다.
         # TestClient로 라우터만 띄운 경우처럼 미등록이면 곧바로 Ollama로 넘어간다.
@@ -514,7 +441,7 @@ async def report_subject(subject: str, req: dict):
                 f"이 개념에서 학생들이 가장 자주 하는 핵심 실수 1가지와 "
                 f"그것을 극복하는 구체적인 학습 전략을 2~3문장으로 간결하게 한국어로 답해주세요."
             )
-            llm_insight = await _ollama_analyze(prompt)
+            llm_insight = await _report_ollama(prompt)
             fallback_stats.record("concept", "ollama" if llm_insight else "none")
 
         if llm_insight:
@@ -538,37 +465,56 @@ ASK_MAX_CHARS = 300
 
 @router.post("/ask")
 async def ai_ask(req: dict):
-    """학생이 직접 쓴 학습 질문에 답한다(Front 'AI에게 질문하기' → Backend /api/ai/ask).
+    """질문 내용과 실제 사용한 참고 자료를 구분해 앱으로 반환한다."""
 
-    과목은 요청의 subject, 없으면 질문에서 감지한다. 개념 추천과 같은 검색(ConceptMap → 그 과목
-    FAISS)으로 자료를 찾아 근거로 붙이고, 같은 생성 함수(_concept_explain)로 답한다 — 문자 차단·
-    후처리·근거 규칙이 개념 설명과 같다. Qwen이 실패하면 Ollama, 그것도 실패하면 answer=None.
-
-    과목을 알 수 없으면 생성하지 않고 needSubject=true를 돌려준다(과목별 system 프롬프트와 문자
-    차단이 과목에 따라 달라서 과목 없이 생성할 수 없다).
-    """
-    question = str(req.get("question") or "").strip()
-    if len(question) < 2:
+    question = req.get("question")
+    if not isinstance(question, str) or len(question.strip()) < 2:
         raise HTTPException(status_code=400, detail="질문을 입력해 주세요.")
+    question = question.strip()
     if len(question) > ASK_MAX_CHARS:
         raise HTTPException(status_code=400, detail=f"질문은 {ASK_MAX_CHARS}자 이내로 입력해 주세요.")
-    subject = req.get("subject") or None
+    subject = req.get("subject")
+    if subject is not None and not isinstance(subject, str):
+        raise HTTPException(status_code=400, detail="지원하지 않는 과목입니다.")
+    if subject is not None:
+        subject = subject.strip() or None
     if subject is not None and subject not in _SUBJECT_KEYWORDS:
         raise HTTPException(status_code=400, detail=f"지원하지 않는 과목입니다: {subject}")
     subject = subject or detect_subject(question)
     if subject is None:
-        return {"subject": None, "question": question, "answer": None, "grounded": False, "needSubject": True}
+        return {"subject": None, "question": question, "answer": None, "grounded": False,
+                "needSubject": True, "answerKind": "clarification"}
+    if missing_exercise(question):
+        return {"subject": subject, "question": question,
+                "answer": "문제 본문과 주어진 조건을 적어 주세요. 보기가 있다면 함께 보내 주세요.",
+                "grounded": False, "needSubject": False, "answerKind": "clarification"}
 
-    docs = subject_aware_search(subject, question, k=3)
-    grounded = bool(usable_docs(docs))
+    answer_only = wants_answer_only(question)
+    if subject == "수학":
+        solution = solve_linear(question, answer_only=answer_only)
+        if solution is not None:
+            return {"subject": subject, "question": question, "answer": solution, "grounded": False,
+                    "needSubject": False, "answerKind": "answer"}
+    docs = await run_in_threadpool(subject_aware_search, subject, question, k=3)
+    if subject == "국어":
+        figure = classify_quoted_figure(question, docs, answer_only)
+        if figure:
+            return {"subject": subject, "question": question, "answer": figure, "grounded": True,
+                    "needSubject": False, "answerKind": "answer"}
+    prompt, has_reference = question_prompt(subject, question, docs)
+    grounded = False
+    kind = "answer"
     answer = None
     concept_explain = model_registry.get("concept_explain")
     if concept_explain:
-        answer = await run_in_threadpool(
-            concept_explain, subject, question, docs, question_user_message(question, docs))
+        qwen_prompt = (f'{tutor_instruction(subject)}\n{{"근거":"…","답변":"…","유형":"…"}} '
+                       f'형식의 JSON으로 반환하세요.\n\n{prompt}')
+        generated = await run_in_threadpool(concept_explain, subject, question, docs, qwen_prompt)
+        answer, grounded, kind = read_answer(generated, has_reference, answer_only=answer_only)
         if answer:
             fallback_stats.record("ask", "qwen")
     if not answer:
-        answer = await _ollama_analyze(question_user_message(question, docs))
+        answer, grounded, kind = await ollama_answer(subject, prompt, has_reference, answer_only)
         fallback_stats.record("ask", "ollama" if answer else "none")
-    return {"subject": subject, "question": question, "answer": answer, "grounded": grounded, "needSubject": False}
+    return {"subject": subject, "question": question, "answer": answer, "grounded": grounded,
+            "needSubject": False, "answerKind": kind}
