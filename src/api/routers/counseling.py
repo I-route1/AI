@@ -4,14 +4,14 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from src.api.ask_quality import availability_notice, missing_exercise, ollama_answer, question_prompt, read_answer, tutor_instruction, verify_reported_claim, wants_answer_only
+from src.api.ask_quality import availability_notice, missing_exercise, ollama_answer, part_whole_answer, question_prompt, read_answer, tutor_instruction, verify_reported_claim, wants_answer_only
 from src.api.linear_equation import solve_linear
 from src.api.literature import classify_quoted_figure
 from src.api import fallback_stats, model_registry
 from src.api.concept_map import search_concept_map
 from src.api.generation import OLLAMA_CPU, OLLAMA_URL, ollama_request
 from src.api.java_client import get_student_weakness_from_java
-from src.api.grounding import context_block, is_curated
+from src.api.grounding import is_curated
 from src.api.postprocess import strip_chat_frame, strip_markdown
 from src.api.report_text import complete_generation, material_excerpt, positive_measurement
 from src.api.script_guard import has_foreign, strip_foreign
@@ -58,11 +58,50 @@ def _study_guide(subject: str, concept: str, materials: str) -> str:
             f"2단계 — {_review_activity(subject, concept, materials)}\n\n[스스로 확인]\n{check}")
 
 
-def _report_prompt(subject: str, concept: str, docs: list[str]) -> str:
-    return (f"{context_block(docs)}"
-            f"{subject} '{concept}'을 복습하는 학생에게, 원리 하나를 쉬운 말로 설명하고 "
-            "짧은 예에서 그 원리를 어떻게 확인하는지 보여 주세요. "
-            "학생의 실제 오답이나 습관을 추정하지 마세요. 같은 조언을 되풀이하지 마세요.")
+_RECALL_TASK = {
+    "과학": "개념을 한 문장으로 정의해 보세요. 사례도 하나 떠올리고, 그 사례에서만 보이는 특징과 정의에 필요한 조건을 구분하세요.",
+    "사회": "핵심 사실을 한 문장으로 말해 보세요. 그 사실을 뒷받침하는 사건이나 사례도 하나 떠올려 보세요.",
+    "영어": "이 표현의 뜻과 영어 문장에서 쓰이는 형태를 자신의 말로 설명해 보세요.",
+    "수학": "이 개념을 쓸 수 있는 조건과 풀이에서 가장 먼저 확인할 것을 말해 보세요.",
+    "국어": "해당하는 표현이나 구절을 떠올리고, 어떤 점을 보고 그렇게 판단했는지 설명하세요.",
+}
+
+
+def _verified_focus(selection: str | None, material: str, concept: str) -> str:
+    # Only use a short literal cue from the printed source. A selection is a pointer,
+    # never a free-standing claim. Reject invented, clipped or sentence-length text.
+    phrase = (selection or "").strip().strip('"\'‘’“”').strip()
+    if not 3 <= len(phrase) <= 40 or phrase == concept or "\n" in phrase:
+        return ""
+    if phrase not in material or re.search(r"[.!?。！？]$|\b(?:a|an|the|is|are|was|were|has|have|to|of|by)$", phrase, re.I):
+        return ""
+    if not re.search(r"(?<![A-Za-z0-9])" + re.escape(phrase) + r"(?![A-Za-z0-9])", material):
+        return ""
+    return phrase
+
+
+async def _source_review(subject: str, concept: str, material: str) -> str:
+    if not concept:
+        return ""
+    if not material:
+        return (f"\n\n[교과서로 확인하기]\n교과서에서 ‘{concept}’의 설명을 찾으세요. "
+                "책을 덮고 자신의 말로 설명한 뒤 원문과 대조하세요.")
+    prompt = (f"{subject} ‘{concept}’을 복습할 때 확인해야 할 구절을 아래 교과 자료에서 그대로 고르세요. "
+              "개념 이름 단독이나 문장 전체를 피하고, 뜻이 통하는 짧은 구절 하나만 쓰세요.\n" + material)
+    model = model_registry.get("concept_explain")
+    selection = await run_in_threadpool(model, subject, concept, [material], prompt) if model else None
+    if selection:
+        fallback_stats.record("concept", "qwen")
+    else:
+        selection = await _ollama_analyze(prompt, timeout=15.0, max_tokens=45, retry_foreign=False)
+        fallback_stats.record("concept", "ollama" if selection else "none")
+    cue = _verified_focus(selection, material, concept)
+    # These prompts ask the student to recall a principle before reopening the source.
+    # No scientific definition, historical example or numeric result is synthesized here.
+    task = _RECALL_TASK.get(subject, "이 개념을 자신의 말로 설명해 보세요.")
+    confirmation = (f"다시 읽고 ‘{cue}’가 자신의 설명에 어떻게 반영됐는지 확인하세요."
+                    if cue else "다시 읽고 자신의 설명을 뒷받침하는 구절 한 곳을 짚으세요.")
+    return f"\n\n[자료로 확인하기]\n자료를 가리고 ‘{concept}’ 단원을 떠올리세요. {task}\n{confirmation}"
 
 
 async def _ollama_once(client: httpx.AsyncClient, prompt: str, timeout: float,
@@ -228,11 +267,11 @@ def _direction_line(req: dict, concept: str) -> str:
     return f"● 학습 방향: {label}\n" if label and label != concept else ""
 
 
-def _math_report(req: dict, concept: str) -> tuple[dict, list[str]]:
+def _math_report(req: dict, concept: str) -> tuple[dict, str]:
     return _subject_report("수학", req, concept)
 
 
-def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[str]]:
+def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, str]:
     percentile, basis = _level_basis(subject, req)
     rag_docs = subject_aware_search(subject, concept, k=3) if concept else []
     rag_text = _material_lines(rag_docs, concept)
@@ -269,10 +308,10 @@ def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[s
         "title": f"{subject} 메타인지 분석 리포트",
         "careerAnalysis": analysis,
         "learningGuide": guide,
-    }, rag_docs
+    }, rag_text
 
 
-def _writing_report(req: dict, concept: str) -> dict:
+def _writing_report(req: dict, concept: str) -> tuple[dict, str]:
     student_id    = req.get("studentId", "")
     percentile, basis = _level_basis("국어", req)
     student_note  = req.get("studentNote") or ""
@@ -322,7 +361,7 @@ def _writing_report(req: dict, concept: str) -> dict:
         "title": "AI 기반 진로 탐색 리포트",
         "careerAnalysis": career_analysis,
         "learningGuide": learning_guide,
-    }
+    }, rag_text
 
 
 def _premium_subject(req: dict) -> str:
@@ -374,28 +413,44 @@ def _premium_report(req: dict, concept: str) -> dict:
 @router.post("/report/math")
 async def report_math(req: dict):
     concept = await run_in_threadpool(_resolve_concept, "수학", req)
-    result, rag_docs = await run_in_threadpool(_math_report, req, concept)
-    if concept:
-        prompt = _report_prompt("수학", concept, rag_docs)
-        llm_insight = await _advice(prompt, "수학")
-        if llm_insight:
-            result["careerAnalysis"] += f"\n\n[AI 개념 설명]\n{llm_insight}"
+    result, material = await run_in_threadpool(_math_report, req, concept)
+    result["careerAnalysis"] += await _source_review("수학", concept, material)
     return result
+
+
+_WRITING_QUOTES = re.compile(r'''"([^"\n]+)"|'([^'\n]+)'|“([^”\n]+)”|‘([^’\n]+)’|「([^」\n]+)」|『([^』\n]+)』|《([^》\n]+)》|`([^`\n]+)`''')
+_EXAMPLE_LEAD = re.compile(r"(?:예를\s*들(?:어|면)|예컨대|가령)\s*[,：:]?\s*|(?:예시|예문|예)\s*[:：]\s*")
+
+
+def _writing_advice_supported(advice: str, material: str) -> bool:
+    """Writing advice may point to the shown passage. Omit invented or unclosed illustrations."""
+    source = " ".join(material.split())
+    def check_quote(match: re.Match) -> str:
+        quotation = next(group for group in match.groups() if group is not None)
+        return "\x01" if " ".join(quotation.split()) in source else "\x02"
+
+    remaining = _WRITING_QUOTES.sub(check_quote, advice)
+    if re.search(r"""[\x02'"“”‘’「」『』《》`]""", remaining):
+        return False
+    return all(remaining[lead.end():].startswith("\x01") for lead in _EXAMPLE_LEAD.finditer(remaining))
 
 
 @router.post("/report/writing")
 async def report_writing(req: dict):
     concept = await run_in_threadpool(_resolve_concept, "국어", req)
-    result = await run_in_threadpool(_writing_report, req, concept)
+    result, material = await run_in_threadpool(_writing_report, req, concept)
     note = (req.get("studentNote") or "").strip()
     _, basis = _level_basis("국어", req)
     prompt = (
+        f"[학생에게 표시한 교과 자료]\n{material or '없음'}\n\n"
         f"성적 정보: {basis}. 학습 시간: {_study_time(req)}. "
         f"학생 특성: '{note or '특이사항 없음'}'.{_feedback_clause(req)} "
-        f"이번에 연습할 국어 개념: {concept or '지문 읽기와 글쓰기'}. {_ADVICE_RULES}"
+        f"이번에 연습할 국어 개념: {concept or '지문 읽기와 글쓰기'}. {_ADVICE_RULES} "
+        "교과서에서 학생이 할 일과 점검 방법만 쓰세요. 예문을 새로 만들지 마세요. "
+        "문장을 직접 인용한다면 위 교과 자료의 원문을 그대로 따옴표 안에 쓰세요."
     )
     llm_insight = await _advice(prompt, "국어")
-    if llm_insight:
+    if llm_insight and _writing_advice_supported(llm_insight, material):
         result["learningGuide"] += f"\n\n[AI 복습 제안]\n{llm_insight}"
     return result
 
@@ -427,26 +482,8 @@ async def report_subject(subject: str, req: dict):
         raise HTTPException(status_code=404, detail=f"지원하지 않는 과목입니다: {subject}")
 
     concept = await run_in_threadpool(_resolve_concept, subject, req)
-    result, rag_docs = await run_in_threadpool(_subject_report, subject, req, concept)
-    if concept:
-        # 1순위: main.py의 _concept_explain()(베이스 Qwen). main.py가 registry에 등록한다.
-        # TestClient로 라우터만 띄운 경우처럼 미등록이면 곧바로 Ollama로 넘어간다.
-        # rag_docs는 concept으로 검색한 것이다.
-        llm_insight = None
-        prompt = _report_prompt(subject, concept, rag_docs)
-        concept_explain = model_registry.get("concept_explain")
-        if concept_explain:
-            llm_insight = await run_in_threadpool(concept_explain, subject, concept, rag_docs, prompt)
-            if llm_insight:
-                fallback_stats.record("concept", "qwen")
-
-        # 2순위: _concept_explain()이 None을 준 경우(생성 실패) Ollama
-        if not llm_insight:
-            llm_insight = await _report_ollama(prompt)
-            fallback_stats.record("concept", "ollama" if llm_insight else "none")
-
-        if llm_insight:
-            result["careerAnalysis"] += f"\n\n[AI 개념 설명]\n{llm_insight}"
+    result, material = await run_in_threadpool(_subject_report, subject, req, concept)
+    result["careerAnalysis"] += await _source_review(subject, concept, material)
     return result
 
 
@@ -484,7 +521,9 @@ async def ai_ask(req: dict):
     if notice := availability_notice(question):
         return {"subject": subject, "question": question, "answer": notice, "grounded": False,
                 "needSubject": False, "answerKind": "out_of_scope"}
-    subject = subject or detect_subject(question)
+    answer_only = wants_answer_only(question)
+    conversion = part_whole_answer(question, answer_only=answer_only) if subject in (None, "수학") else None
+    subject = "수학" if conversion else subject or detect_subject(question)
     if subject is None:
         return {"subject": None, "question": question, "answer": None, "grounded": False,
                 "needSubject": True, "answerKind": "clarification"}
@@ -493,9 +532,8 @@ async def ai_ask(req: dict):
                 "answer": "문제 본문과 주어진 조건을 적어 주세요. 보기가 있다면 함께 보내 주세요.",
                 "grounded": False, "needSubject": False, "answerKind": "clarification"}
 
-    answer_only = wants_answer_only(question)
     if subject == "수학":
-        solution = solve_linear(question, answer_only=answer_only)
+        solution = conversion or solve_linear(question, answer_only=answer_only)
         if solution is not None:
             return {"subject": subject, "question": question, "answer": solution, "grounded": False,
                     "needSubject": False, "answerKind": "answer"}

@@ -30,7 +30,7 @@ class ReportFactsTest(TestCase):
                     {"studyTime": 28, "subjectPercentile": True}):
             for builder in (lambda: counseling._subject_report("영어", req, "")[0],
                             lambda: counseling._math_report(req, "")[0],
-                            lambda: counseling._writing_report(req, ""),
+                            lambda: counseling._writing_report(req, "")[0],
                             lambda: counseling._premium_report(req, "")):
                 with self.subTest(req=req), patch.object(counseling, "subject_aware_search", return_value=[]):
                     result = builder()
@@ -88,7 +88,7 @@ class ReportFactsTest(TestCase):
         self.assertNotIn("99%", result["learningGuide"])
 
     def test_writing_uses_different_checks_with_the_same_observed_concept(self):
-        guides = [counseling._writing_report({"subjectPercentile": percentile}, "비유")["learningGuide"]
+        guides = [counseling._writing_report({"subjectPercentile": percentile}, "비유")[0]["learningGuide"]
                   for percentile in (40, 65, 81)]
         self.assertTrue(all("비유" in guide for guide in guides))
         self.assertIn("낱말", guides[0])
@@ -160,13 +160,49 @@ class ReportModelTest(IsolatedAsyncioTestCase):
         self.assertLess(async_mock.await_args.kwargs["max_tokens"], 150)
 
     async def test_model_failure_preserves_real_report(self):
-        with patch.object(counseling,"_report_ollama",AsyncMock(return_value=None)), \
+        with patch.object(counseling,"_ollama_analyze",AsyncMock(return_value=None)), \
              patch.object(counseling.model_registry,"get",return_value=None):
             result = await counseling.report_subject("영어", {"studentId":7,"subjectPercentile":72,
                                                             "studyTime":1.5,"weakConcept":"수동태"})
         self.assertIn("영어 백분위 72%",result["careerAnalysis"])
         self.assertNotIn("[AI 개념 설명]",result["careerAnalysis"])
         self.assertIn("수동태",result["learningGuide"])
+        self.assertIn("[자료로 확인하기]", result["careerAnalysis"])
+
+    async def test_claims_absent_from_displayed_source_are_never_shown(self):
+        for subject, concept, bogus, source_fact in (
+                ("사회", "훈민정음", "한자로는 '하나'를 쓰지만", "1443년"),
+                ("과학", "응결", "수증기가 차가운 표면에 닿아야만 응결이 일어난다.", "수증기가 액체 물로"),
+                ("영어", "수동태", "The book was", "과거분사")):
+            with self.subTest(subject=subject), patch.object(counseling.model_registry, "get", return_value=None), \
+                    patch.object(counseling, "_ollama_analyze", AsyncMock(return_value=bogus)) as generate:
+                result = await counseling.report_subject(subject, {"weakConcept": concept})
+                analysis = result["careerAnalysis"]
+                self.assertIn(source_fact, analysis)
+                self.assertNotIn(bogus, analysis)
+                self.assertNotIn("[AI 개념 설명]", analysis)
+                self.assertIn("[자료로 확인하기]", analysis)
+                self.assertIn(source_fact, generate.await_args.args[0])
+                if subject == "과학":
+                    self.assertIn("정의에 필요한 조건", analysis)
+                if subject == "영어":
+                    self.assertIn("주어가 동작을 받음", analysis)
+
+    async def test_source_review_checks_cue_against_complete_visible_span(self):
+        material = "• 수동태 예문은 The book was written yesterday."
+        for cue, accepted in (("The book was", False), ("ook was written", False),
+                              ("was written", True), ("예시: was written", False)):
+            with self.subTest(cue=cue), patch.object(counseling.model_registry, "get",
+                    return_value=Mock(return_value=cue)), patch.object(counseling, "_ollama_analyze", AsyncMock()) as secondary:
+                check = await counseling._source_review("영어", "수동태", material)
+                self.assertEqual(accepted, f"‘{cue}’" in check)
+                secondary.assert_not_awaited()
+        with patch.object(counseling, "_ollama_analyze", AsyncMock()) as generate:
+            check = await counseling._source_review("과학", "열", "")
+            self.assertIn("[교과서로 확인하기]", check)
+            self.assertNotIn("AI", check)
+            self.assertEqual("", await counseling._source_review("과학", "", ""))
+            generate.assert_not_awaited()
 
     async def test_advice_and_observations_appear_in_separate_fields(self):
         req = {"studentId": 7, "weakConcept": "비유", "weakSubject": "국어",
@@ -178,6 +214,30 @@ class ReportModelTest(IsolatedAsyncioTestCase):
                 self.assertIn(req["instructorFeedback"], result["careerAnalysis"])
                 self.assertNotIn(advice, result["careerAnalysis"])
                 self.assertIn("[AI 복습 제안]\n" + advice, result["learningGuide"])
+
+    async def test_writing_rejects_invented_example_but_keeps_grounded_activity(self):
+        req = {"studentId": 7, "weakConcept": "은유법"}
+        actual = "학생은 은유법을 활용한 예문을 만들어 보는 활동을 할 수 있다. 예를 들어, \"그의 말은 바람처럼 가볍다\"와 같은 표현을 스스로 구성해 보세요."
+        for suggestion in (actual, "예를 들어 그의 말은 바람처럼 가볍다.", "예문: 생각은 숲이다."):
+            with self.subTest(suggestion=suggestion), patch.object(counseling, "_advice", AsyncMock(return_value=suggestion)) as generate:
+                report = await counseling.report_writing(req)
+                self.assertIn("네 미소는 햇살이다", generate.await_args.args[0])
+                self.assertIn("예문을 새로 만들지 마세요", generate.await_args.args[0])
+                self.assertNotIn("[AI 복습 제안]", report["learningGuide"])
+                self.assertIn("[스스로 확인]", report["learningGuide"])
+                self.assertIn("네 미소는 햇살이다", report["careerAnalysis"])
+
+    async def test_writing_allows_source_quotation_and_handles_missing_material(self):
+        grounded = "예를 들어, ‘네 미소는 햇살이다’에서 두 대상을 찾아보세요."
+        with patch.object(counseling, "_advice", AsyncMock(return_value=grounded)):
+            report = await counseling.report_writing({"weakConcept": "은유법"})
+            self.assertIn(grounded, report["learningGuide"])
+            missing = await counseling.report_writing({"weakConcept": ""})
+            self.assertNotIn(grounded, missing["learningGuide"])
+        direct = "교과서에서 고른 구절을 가리고 그 뜻을 설명해 보세요."
+        with patch.object(counseling, "_advice", AsyncMock(return_value=direct)):
+            missing = await counseling.report_writing({"weakConcept": ""})
+            self.assertIn(direct, missing["learningGuide"])
 
 
 if __name__ == "__main__":
