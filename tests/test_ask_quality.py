@@ -1,7 +1,8 @@
+import asyncio
 import json
 import unittest
 
-from src.api.ask_quality import missing_exercise, question_prompt, read_answer, wants_answer_only
+from src.api.ask_quality import _plain_retry, missing_exercise, question_prompt, read_answer, wants_answer_only
 from src.api.concept_map import search_concept_map
 from src.api.linear_equation import solve_linear
 
@@ -85,6 +86,30 @@ class AskQualityTest(unittest.TestCase):
         self.assertEqual(read_answer('{"답변":"답은', True, length_limited=True), (None, False, "answer"))
         self.assertEqual(read_answer('잘린 JSON {"유형":', True), (None, False, "answer"))
         self.assertEqual(read_answer('{"유형": "확인", "답변": 3}', True), (None, False, "answer"))
+
+    def test_completed_fields_can_be_in_any_order(self):
+        text = '{"답변":"2개입니다.","근거":"교점이 둘입니다.","유형":"자'
+        self.assertEqual(read_answer(text, True, length_limited=True),
+                         ("2개입니다.\n교점이 둘입니다.", False, "answer"))
+        text = '{"유형":"자료","답변":"2개입니다.","근거":"교점이 둘입니다."'
+        self.assertEqual(read_answer(text, True, length_limited=True),
+                         ("2개입니다.\n교점이 둘입니다.", True, "answer"))
+
+    def test_early_stop_inside_answer_triggers_recovery_and_never_exposes_thinking(self):
+        broken = '{"근거":"be + 과거분사 형태입니다.","답변":"was made}</think>'
+        self.assertEqual(read_answer(broken, True), (None, False, "answer"))
+        broken = json.dumps({"근거":"<think>hidden</think>", "답변":"was made", "유형":"자료"})
+        self.assertEqual(read_answer(broken, True), (None, False, "answer"))
+
+    def test_plain_recovery_preserves_words_and_discards_incomplete_tail(self):
+        async def generate(body):
+            self.assertNotIn("format", body)
+            return {"response":"동사 표현은 was made입니다. was에 이어지는", "done_reason":"length"}
+        self.assertEqual(asyncio.run(_plain_retry(generate, "합성 문제", False)), "동사 표현은 was made입니다.")
+
+        async def internal(_body):
+            return {"response":"<think>internal</think>결론", "done_reason":"stop"}
+        self.assertIsNone(asyncio.run(_plain_retry(internal, "합성 문제", True)))
 
 
 if __name__ == "__main__":

@@ -81,6 +81,28 @@ class ReportFactsTest(TestCase):
         self.assertIn("과학 ‘운동량’", result["learningGuide"])
         self.assertNotIn("99%", result["learningGuide"])
 
+    def test_history_activity_uses_dates_shown_in_this_units_source(self):
+        for concept, docs, expected in (
+                ("훈민정음", search_concept_map("사회", "훈민정음", 1), ("1443년", "1446년")),
+                ("선거 제도", ["선거 제도 자료에 1948년과 1987년의 사례가 실려 있다."], ("1948년", "1987년"))):
+            with self.subTest(concept=concept), patch.object(counseling, "subject_aware_search", return_value=docs):
+                result, _ = counseling._subject_report("사회", {"subjectPercentile": 82}, concept)
+                step = result["learningGuide"].split("4단계")[1]
+                for term in (concept, *expected, "두 기록의 차이"):
+                    self.assertIn(term, step)
+                self.assertNotIn("시사 이슈", step)
+
+    def test_general_social_and_math_checks_stay_with_the_concept(self):
+        cases = (("사회", "기회비용", "사례 하나"), ("수학", "일차방정식", "조건 하나"))
+        for subject, concept, expected in cases:
+            with self.subTest(subject=subject), patch.object(counseling, "subject_aware_search",
+                    return_value=["다른 단원에 1443년과 1446년이 나온다."]):
+                result, _ = counseling._subject_report(subject, {"subjectPercentile": 52}, concept)
+                step = result["learningGuide"].split("4단계")[1]
+                self.assertIn(concept, step)
+                self.assertIn(expected, step)
+                self.assertNotIn("1443년", step)
+
     def test_cut_text_and_valid_equation(self):
         self.assertEqual('확률은 0.25입니다.', complete_generation('확률은 0.25입니다. 다음으로 식에'))
         self.assertEqual('', complete_generation('식에 0.2를 곱한'))

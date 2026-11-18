@@ -1,4 +1,5 @@
 """학생에게 표시할 답변과 자료 사용 여부를 서로 다른 필드로 생성한다."""
+import asyncio
 import json
 import logging
 import re
@@ -38,7 +39,7 @@ def question_prompt(subject: str, question: str, docs: list[str]) -> tuple[str, 
 
 _SYSTEM = (
     "중고등학생의 교과 질문에 한국어로 답하는 교사입니다. "
-    "근거는 판단을 가르는 표현이나 중간 계산식을 한 문장으로, 답변은 물어본 항목의 결론만 짧게 씁니다. "
+    "답변에는 결론을 짧게 쓰고, 근거에는 핵심 표현이나 중간 계산식 하나를 씁니다. "
     "두 필드의 내용을 반복하지 않습니다. 사실과 다른 전제는 바로잡습니다. "
     "자료에 없는 수치나 출처를 지어내지 않습니다. "
     "유형은 참고 자료의 원리를 실제 사용하면 '자료', 일반 지식이나 계산으로 풀면 '풀이', "
@@ -63,6 +64,29 @@ _SCHEMA = {
     "additionalProperties": False,
 }
 _NO_ANSWER = (None, False, "answer")
+_THINK_TAG = re.compile(r"</?think\b|<\|(?:im_|think)", re.IGNORECASE)
+
+
+def _completed_fields(text: str) -> dict[str, str]:
+    """잘린 JSON 객체에서 닫는 따옴표까지 파싱된 필드만 보존한다."""
+    text = text.lstrip()
+    decoder = json.JSONDecoder()
+    fields = {}
+    prefix = r"\{\s*"
+    index = 0
+    while match := re.match(prefix + r'"(근거|답변|유형)"\s*:\s*', text[index:]):
+        key = match.group(1)
+        if key in fields:
+            return {}
+        try:
+            value, index = decoder.raw_decode(text, index + match.end())
+        except ValueError:
+            break
+        if not isinstance(value, str):
+            return {}
+        fields[key] = value
+        prefix = r"\s*,\s*"
+    return fields
 
 
 def read_answer(
@@ -76,19 +100,16 @@ def read_answer(
     except ValueError:
         # 온전한 내용 필드 뒤 마지막 분류 필드/닫는 괄호에서 잘릴 수 있다.
         # JSON 파서가 여전히 거절하는 답변·근거 문자열은 절대 반환하지 않는다.
-        if not length_limited:
+        if not length_limited and not _THINK_TAG.search(text):
             return _NO_ANSWER
-        try:
-            prefix = re.split(r',\s*"유형"\s*:', text, maxsplit=1)[0]
-            data = json.loads(prefix.rstrip() + "}")
-        except ValueError:
-            return _NO_ANSWER
-        if isinstance(data, dict):
-            data.setdefault("유형", "풀이")
+        data = _completed_fields(text)
+        data.setdefault("유형", "풀이")
     if not isinstance(data, dict):
         return _NO_ANSWER
     answer, reason, mode = data.get("답변"), data.get("근거"), data.get("유형")
     if not (isinstance(answer, str) and isinstance(reason, str) and isinstance(mode, str) and mode in _KINDS):
+        return _NO_ANSWER
+    if _THINK_TAG.search(answer) or _THINK_TAG.search(reason):
         return _NO_ANSWER
     answer = strip_chat_frame(strip_markdown(answer))
     reason = strip_chat_frame(strip_markdown(reason))
@@ -110,22 +131,50 @@ async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_o
     import httpx
     from src.api.script_guard import has_foreign, strip_foreign
 
-    payload = ollama_request(prompt, max_tokens=130 if OLLAMA_CPU else 300)
+    payload = ollama_request(prompt, max_tokens=165 if OLLAMA_CPU else 300)
     payload.update(system=tutor_instruction(subject), format=_SCHEMA)
     payload["options"]["temperature"] = 0.1
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(OLLAMA_URL, json=payload, timeout=40.0)
-            response.raise_for_status()
-            result = response.json()
-        if not isinstance(result, dict):
-            return _NO_ANSWER
-        answer, grounded, kind = read_answer(result.get("response"), has_reference,
-                                             length_limited=result.get("done_reason") == "length",
-                                             answer_only=answer_only)
+        # 두 번의 생성이 시작되더라도 Spring의 50초 제한 안에서 함께 끝낸다.
+        async with asyncio.timeout(40), httpx.AsyncClient(timeout=40) as client:
+            async def generate(body):
+                response = await client.post(OLLAMA_URL, json=body)
+                response.raise_for_status()
+                data = response.json()
+                return data if isinstance(data, dict) else {}
+
+            result = await generate(payload)
+            answer, grounded, kind = read_answer(
+                result.get("response"), has_reference,
+                length_limited=result.get("done_reason") == "length", answer_only=answer_only)
+            if not answer:
+                logging.info("[AI 질문] JSON 응답 재생성: 종료=%s", result.get("done_reason"))
+                answer = await _plain_retry(generate, prompt, answer_only)
         if answer and has_foreign(answer):
             answer = strip_foreign(answer).strip()
         return (answer, grounded, kind) if answer else _NO_ANSWER
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.HTTPError, ValueError, TimeoutError) as exc:
         logging.warning("[AI 질문] Ollama 응답 실패: %s", type(exc).__name__)
         return _NO_ANSWER
+
+
+async def _plain_retry(generate, prompt: str, answer_only: bool) -> str | None:
+    instruction = ("학생의 교과 질문에 바로 답하세요. 한국어를 사용하고 영어 예문과 수식은 그대로 씁니다. "
+                   "질문의 조건이 부족하면 필요한 조건을 묻고, 확인할 수 없는 사실을 지어내지 않습니다. ")
+    instruction += "정답만 짧게 쓰세요." if answer_only else "결론과 그 이유를 한두 문장으로 쓰세요."
+    retry = ollama_request(prompt, max_tokens=95 if OLLAMA_CPU else 170)
+    retry.update(system=instruction)
+    retry["options"]["temperature"] = 0
+    result = await generate(retry)
+    text = result.get("response")
+    if not isinstance(text, str) or not text.strip() or _THINK_TAG.search(text):
+        return None
+    if text.lstrip().startswith(("{", "```")):
+        return None
+    if result.get("done_reason") == "length":
+        # 한국어 문장이나 영문 마침표 뒤에 남은 미완성 꼬리를 버린다.
+        endings = list(re.finditer(r"(?:[가-힣][.!?]|[A-Za-z][!?]|[A-Za-z]{2,}\.)(?=\s|$)", text))
+        if not endings:
+            return None
+        text = text[:endings[-1].end()]
+    return strip_chat_frame(strip_markdown(text))

@@ -4,7 +4,7 @@ import re
 
 _QUOTATION = re.compile(r"""“([^”]+)”|‘([^’]+)’|"([^"]+)"|'([^']+)'""")
 _NAME_REQUEST = re.compile(r"(?:어떤|무슨|어느)\s*비유법|비유법(?:의)?\s*(?:이름|종류|명칭)|직유(?:법)?(?:인지|와|인가).*은유")
-_OTHER_TASK = re.compile(r"효과|정서|심리|분위기|창작|바꿔|바꾸|고쳐|새로|예시|예문|각각|여러|의인|반어|반복|상징")
+_OTHER_TASK = re.compile(r"효과|정서|심리|분위기|창작|바꿔|바꾸|고쳐|새로|예시|예문|각각|여러|의인|반어|반복|상징|문자\s*그대로|비유.{0,4}아닌|사실.{0,3}비교")
 _TOPIC = r"(?P<topic>[가-힣]{1,12}(?:\s+[가-힣]{1,12}){0,2}?)(?:은|는)"
 _COMPARISON = re.compile(_TOPIC + r"\s+(?P<image>[가-힣]{1,12})처럼\s+[가-힣 ]{1,35}")
 _IDENTITY = re.compile(_TOPIC + r"\s+(?P<image>[가-힣]{1,12}?)(?:이었다|였다|이다)")
@@ -24,6 +24,10 @@ def classify_quoted_figure(question: str, references: list[str], answer_only: bo
     comparison = _COMPARISON.fullmatch(sample)
     if comparison:
         topic, image = comparison["topic"], comparison["image"]
+        # '평소처럼' indicates a familiar circumstance. Kinship/role comparisons
+        # can also be literal. The marker alone cannot establish a literary device.
+        if re.search(r"평소|어제|예전|전날|오늘|어릴때|작년|저번|그때|옛날|엄마|아빠|아버지|어머니|형|누나|언니|선생님|친구|동생", image):
+            return None
         reason = f"‘{image}처럼’에서 ‘처럼’이 두 대상을 연결합니다. ‘{topic}’의 모습을 ‘{image}’에 빗댔습니다."
         return "직유법입니다." if answer_only else "직유법입니다. " + reason
     # A literal identity can use exactly the same grammar. Only apply the rule when

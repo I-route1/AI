@@ -18,6 +18,8 @@ class QuotedFigureTest(unittest.TestCase):
         for question in ("‘고래는 포유류이다.’는 어떤 비유법인가요?",
                          "‘단풍은 불꽃처럼 붉다.’에 쓴 비유법의 이름과 효과는?",
                          "‘집으로 같이 가자’에는 어떤 비유법이 있나요?",
+                         "‘동생은 평소처럼 걸었다’에는 어떤 비유법이 있나요?",
+                         "‘그는 아버지처럼 의사가 되었다’에는 어떤 비유법이 있나요?",
                          "‘눈은 꽃처럼 피었다’와 ‘봄은 축제이다’의 비유법의 이름은?"):
             with self.subTest(question=question):
                 self.assertIsNone(self.classify(question))

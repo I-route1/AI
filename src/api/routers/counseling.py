@@ -1,3 +1,5 @@
+import re
+
 import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -35,14 +37,27 @@ _MISTAKE_TYPES = {
     "사회":   "암기 부족 / 개념 간 혼동 / 자료 해석 오류",
 }
 
-# 과목별 백분위 구간(상/중/하)에 따른 학습 전략
-_STRATEGY = {
-    "수학":   {"high": "킬러문항 집중 훈련, 시간 단축 연습", "mid": "오답 유형 분류 후 유형별 집중 풀이", "low": "교과서 개념부터 순서대로 재정리"},
-    "영어":   {"high": "고난도 빈칸·순서 유형 반복", "mid": "구문 독해 → 유형별 문제풀이 순서로", "low": "핵심 문법 5개 + 단어 20개/일 암기"},
-    "국어":   {"high": "고전 문학 + 현대소설 심층 독해", "mid": "비문학 지문 구조 파악 훈련", "low": "짧은 지문 요약 훈련으로 독해력 향상"},
-    "과학":   {"high": "실험·탐구 서술형 고난도 문항 반복", "mid": "단원별 핵심 개념 정리 후 응용 문제 풀이", "low": "교과서 개념 정의부터 순서대로 재학습"},
-    "사회":   {"high": "시사 이슈 연계 자료 해석 심화 훈련", "mid": "개념 간 비교표 작성 후 기출 문제 풀이", "low": "핵심 용어 암기 + 단원 요약 정리"},
+_REVIEW_ACTIVITY = {
+    "수학": "예제의 조건 하나를 바꾸어 다시 풀고, 그 조건이 어느 풀이 단계에 영향을 줬는지 표시하세요.",
+    "영어": "예문에서 핵심 표현에 밑줄을 긋고, 그 표현을 써서 다른 문장을 만드세요.",
+    "국어": "지문에서 개념을 보여 주는 구절을 골라, 그 구절이 해석의 근거가 되는 이유를 적으세요.",
+    "과학": "교과서에서 이 개념이 나타나는 현상 하나를 찾아, 관찰할 수 있는 변화와 그 원인을 나누어 적으세요.",
+    "사회": "사례 하나를 골라 개념의 정의에 해당하는 부분을 표시하고, 둘이 어떻게 연결되는지 적으세요.",
 }
+_CALENDAR_YEAR = re.compile(r"(?<![\d.])(?:(?:기원전|서기)\s*[1-9]\d{0,3}|[1-9]\d{2,3})년(?!간|째|\s*동안)")
+
+
+def _review_activity(subject: str, concept: str, materials: str) -> str:
+    focus = f"‘{concept}’" if concept else "최근에 배운 단원"
+    if subject == "사회" and concept:
+        for note in materials.splitlines():
+            if concept not in note:
+                continue
+            years = list(dict.fromkeys(_CALENDAR_YEAR.findall(note)))
+            if len(years) >= 2:
+                return (f"{focus} 자료에서 {years[0]}과 {years[1]}에 해당하는 내용을 각각 찾아, "
+                        "두 기록의 차이를 한 문장으로 설명해 보세요.")
+    return f"{focus} 복습 활동: {_REVIEW_ACTIVITY[subject]}"
 
 
 async def _ollama_once(client: httpx.AsyncClient, prompt: str, timeout: float,
@@ -232,11 +247,13 @@ def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[s
     hours = positive_measurement(req.get("studyTime"), 24)
     target = f"‘{concept}’" if concept else "최근 배운 단원"
     practice = f"{target}의 예제 한 문제를 풀고, 답을 고른 근거를 한 문장으로 적어 보세요."
+    check = _review_activity(subject, concept, rag_text)
     if percentile is None:
-        check = "다음 시험 성적을 등록한 뒤 이번에 어려웠던 개념을 다시 확인하세요."
-    else:
-        tier = "high" if percentile >= 75 else "mid" if percentile >= 50 else "low"
-        check = _STRATEGY[subject][tier]
+        check += " 다음 시험 성적을 등록한 뒤 같은 개념의 풀이를 비교하세요."
+    elif percentile >= 75:
+        check += " 처음 보는 예에도 같은 원리를 적용할 수 있는지 확인하세요."
+    elif percentile < 50:
+        check += " 막히면 교과서의 첫 예제를 펼쳐 해당 설명을 다시 찾아보세요."
     guide = (
         f"[{subject} 맞춤 학습 전략]\n\n"
         f"1단계 — 교과서나 관련 자료를 읽고 {target}의 핵심을 자신의 말로 정리하세요.\n"
