@@ -35,16 +35,24 @@ def complete_generation(text: str) -> str:
     return ""
 
 
-def material_excerpt(text: str, limit: int) -> str:
-    """가능하면 온전한 문장 경계에서 미리보기를 마친다. 짧은 교과 요약은 통째로 쓴다."""
+_MATERIAL_END = re.compile(r"""(?:[가-힣)\]»”’][.!?。！？]|[A-Za-z]{3,}[.!?]|[!?。！？])["”’')\]]*(?=\s|$)""")
+
+
+def material_excerpt(text: str, limit: int, concept: str = "") -> str:
+    """Pick up to two adjacent, complete source sentences around the selected concept."""
     text = text.strip()
-    if len(text) <= limit:
-        return text
-    boundaries = [end.end() for end in _SENTENCE_END.finditer(text)]
-    fitting = [end for end in boundaries if end <= limit]
-    if fitting:
-        return text[:fitting[-1]]
-    # 긴 수식·문법 예문 자체가 첫 문장인 경우도 있다.
-    if boundaries and boundaries[0] <= 2 * limit:
-        return text[:boundaries[0]]
-    return ""
+    boundaries = [match.end() for match in _MATERIAL_END.finditer(text)]
+    if not boundaries:
+        return text if len(text) <= limit else ""
+    sentences = [text[start:end].strip() for start, end in zip([0] + boundaries, boundaries)]
+    target = "".join(concept.split()).casefold()
+    index = next((i for i, sentence in enumerate(sentences)
+                  if target and target in "".join(sentence.split()).casefold()), 0)
+    excerpt = sentences[index]
+    if len(excerpt) > limit:
+        return ""
+    if index + 1 < len(sentences):
+        pair = excerpt + " " + sentences[index + 1]
+        if len(pair) <= limit:
+            return pair
+    return excerpt

@@ -1,6 +1,5 @@
 """학생에게 표시할 답변과 자료 사용 여부를 서로 다른 필드로 생성한다."""
 import asyncio
-from difflib import SequenceMatcher
 import json
 import logging
 import re
@@ -51,13 +50,19 @@ def availability_notice(question: str) -> str | None:
 def question_prompt(subject: str, question: str, docs: list[str]) -> tuple[str, bool]:
     references = usable_docs(docs)
     notes = "\n".join(references)
-    prompt = f"과목: {subject}\n참고 자료: {notes or '없음'}\n\n학생 질문: {question}"
+    preference = "\n학생은 정답만 원합니다. 답변 필드에 정답만 쓰세요." if wants_answer_only(question) else ""
+    prompt = f"과목: {subject}{preference}\n참고 자료: {notes or '없음'}\n\n학생 질문: {question}"
     return prompt, bool(references)
 
 
-def verify_reported_claim(subject: str, question: str, answer: str) -> tuple[str, bool]:
+_REPORTED_CLAIM = re.compile(r"라고\s*들었|다고\s*들었|라던데|다던데|라는\s*말이\s*(?:맞|사실)")
+
+
+def verify_reported_claim(
+    subject: str, question: str, answer: str | None, docs: list[str] | None = None
+) -> tuple[str | None, bool]:
     """Include the curriculum definition when a student asks whether a claim they heard is true."""
-    if not re.search(r"라고\s*들었|다고\s*들었|라던데|다던데|라는\s*말이\s*(?:맞|사실)", question):
+    if not _REPORTED_CLAIM.search(question):
         return answer, False
     notes = search_concept_map(subject, question, 1)
     if not notes:
@@ -68,13 +73,23 @@ def verify_reported_claim(subject: str, question: str, answer: str) -> tuple[str
     if not first:
         return answer, False
     definition = first.group(1)
-    lines = answer.splitlines()
-    if len(lines) == 2:
-        compact = [re.sub(r"[\s.,'’‘!?]+", "", line).casefold() for line in lines]
-        symbols = r"[\dA-Za-z+=<>−/-]+|아니|않|없|못"
-        if (re.findall(symbols, compact[0]) == re.findall(symbols, compact[1])
-                and SequenceMatcher(None, *compact).ratio() >= .88):
-            answer = lines[0]
+    if not answer:
+        # Without a generated answer, cite only an actual direct lookup with a
+        # matching definition AND a complete explanation of what was asked.
+        if not docs or notes[0] not in docs:
+            return None, False
+        topic = re.match(r"^([가-힣]{1,12}?)(?:은|는)\s", definition)
+        if not topic or topic.group(1) not in question:
+            return None, False
+        focus = re.split(r"[.!?]\s+", question.rstrip(".!? "))[-1]
+        words = re.findall(r"[가-힣]{2,}", focus)
+        pairs = {f"{left} {right}" for left, right in zip(words, words[1:])}
+        for statement in re.split(r"(?<=\.)\s+", notes[0])[1:]:
+            if (len(statement) <= 160 and statement.endswith("다.") and
+                    re.search(r"때문|까닭|원인이|하므로|이므로", statement) and
+                    any(pair in statement for pair in pairs)):
+                return f"교과 자료 · {definition}\n교과 자료 · {statement}", True
+        return None, False
     if definition not in answer:
         answer += "\n교과 자료 · " + definition
     return answer, True
@@ -82,8 +97,10 @@ def verify_reported_claim(subject: str, question: str, answer: str) -> tuple[str
 
 _SYSTEM = (
     "중고등학생의 교과 질문에 한국어로 답하는 교사입니다. "
-    "답변에는 결론을 짧게 쓰고, 근거에는 핵심 표현이나 중간 계산식 하나를 씁니다. "
-    "두 필드의 내용을 반복하지 않습니다. 사실과 다른 전제는 바로잡습니다. "
+    "답변에는 학생이 물은 각 항목의 결론을 먼저 짧게 씁니다. "
+    "근거는 예문의 단서가 뜻하는 바나 원리를 한 문장으로, 계산이면 중간 식으로 씁니다. "
+    "비교할 두 대상의 뜻은 한 번씩만 설명합니다. 예시는 요청할 때만 씁니다. "
+    "이미 이유까지 답했으면 근거는 빈 문자열로 둡니다. 사실과 다른 전제는 바로잡습니다. "
     "자료에 없는 수치나 출처를 지어내지 않습니다. "
     "유형은 참고 자료의 원리를 실제 사용하면 '자료', 일반 지식이나 계산으로 풀면 '풀이', "
     "문제 본문이나 조건을 더 받아야 하면 '확인', 학습 외 요청이나 확인할 수 없는 실시간 정보면 '범위밖'입니다."
@@ -102,14 +119,52 @@ def tutor_instruction(subject: str) -> str:
 _KINDS = {"자료": "answer", "풀이": "answer", "확인": "clarification", "범위밖": "out_of_scope"}
 _SCHEMA = {
     "type": "object",
-    "properties": {"근거": {"type": "string", "minLength": 1},
-                   "답변": {"type": "string", "minLength": 1},
+    "properties": {"답변": {"type": "string", "minLength": 1},
+                   "근거": {"type": "string"},
                    "유형": {"type": "string", "enum": list(_KINDS)}},
-    "required": ["근거", "답변", "유형"],
+    "required": ["답변", "근거", "유형"],
     "additionalProperties": False,
 }
 _NO_ANSWER = (None, False, "answer")
 _THINK_TAG = re.compile(r"</?think\b|<\|(?:im_|think)", re.IGNORECASE)
+
+
+def _reading_form(text: str) -> str:
+    # Compare wording, not mathematical meaning. Keep operators, decimals, word
+    # order, English case and Korean negation; change only punctuation and register.
+    text = re.sub(r"[‘’“”\"']", "", text.strip().rstrip(".?!"))
+    ending = r"(?=[.!?]\s|[.!?]$|\s|$)"
+    text = re.sub(r"(?:합니다|해요|한다)" + ending, "하다", text)
+    text = re.sub(r"(?:됩니다|돼요|된다)" + ending, "되다", text)
+    text = re.sub(r"(?:있습니다|있어요|있다)" + ending, "있다", text)
+    text = re.sub(r"(?:없습니다|없어요|없다)" + ending, "없다", text)
+    text = re.sub(r"(?:입니다|이에요|예요|이다)" + ending, "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _explanation(answer: str, reason: str, question: str = "") -> str:
+    """Keep new evidence, including calculations and contrasts in short clauses."""
+    if not reason:
+        return ""
+    displayed = _reading_form(answer)
+    sentences = re.split(r"(?<=[.!?])\s+", reason.strip())
+    remaining = []
+    for sentence in sentences:
+        if (remaining and question and re.match(r"^(?:예를\s*들[어면]|예컨대|가령)\b", sentence)
+                and not re.search(r"예[를시문제]|예\s|사례|적용|언제|어떤\s*경우|실생활|시나리오", question)):
+            break
+        form = _reading_form(sentence)
+        if not form or re.search(r"(?<![\w.+−/\-])" + re.escape(form) + r"(?!\w|[.]\d)", displayed):
+            continue
+        remaining.append(sentence)
+        displayed += " " + form
+    evidence = " ".join(remaining)
+    if re.fullmatch(r"[A-Za-z]+(?:[ '-][A-Za-z0-9]+){0,5}", evidence):
+        # Korean particles can follow an English quote without a space.
+        if re.search(r"(?<![A-Za-z0-9])" + re.escape(evidence) + r"(?![A-Za-z0-9])", answer):
+            return ""
+        return f"판단에 쓰인 표현은 ‘{evidence}’입니다."
+    return evidence
 
 
 def _completed_fields(text: str) -> dict[str, str]:
@@ -135,7 +190,8 @@ def _completed_fields(text: str) -> dict[str, str]:
 
 
 def read_answer(
-    text: str | None, has_reference: bool, *, length_limited: bool = False, answer_only: bool = False
+    text: str | None, has_reference: bool, *, length_limited: bool = False,
+    answer_only: bool = False, question: str = ""
 ) -> tuple[str | None, bool, str]:
     """학생에게 필요한 결론과 근거를 합친다. 미완성 JSON 본문은 반환하지 않는다."""
     if not isinstance(text, str) or not text.strip():
@@ -148,6 +204,8 @@ def read_answer(
         if not length_limited and not _THINK_TAG.search(text):
             return _NO_ANSWER
         data = _completed_fields(text)
+        if "답변" in data:
+            data.setdefault("근거", "")
         data.setdefault("유형", "풀이")
     if not isinstance(data, dict):
         return _NO_ANSWER
@@ -156,27 +214,28 @@ def read_answer(
         return _NO_ANSWER
     if _THINK_TAG.search(answer) or _THINK_TAG.search(reason):
         return _NO_ANSWER
-    answer = strip_chat_frame(strip_markdown(answer))
-    reason = strip_chat_frame(strip_markdown(reason))
-    if not answer or not reason:
+    answer = re.sub(r"^(?:답변|정답)\s*[:：]\s*", "", strip_chat_frame(strip_markdown(answer)))
+    reason = re.sub(r"^(?:근거|풀이|설명)\s*[:：]\s*", "", strip_chat_frame(strip_markdown(reason)))
+    if not answer:
         return _NO_ANSWER
-    if not answer_only and mode in ("자료", "풀이") and reason not in answer:
+    if not answer_only and mode in ("자료", "풀이") and (reason := _explanation(answer, reason, question)):
         answer = f"{answer}\n{reason}"
     return answer, has_reference and mode == "자료", _KINDS[mode]
 
 
 def wants_answer_only(question: str) -> bool:
-    if re.search(r"(?:근거|이유|풀이|과정|설명)(?:도|까지)\b", question):
+    if re.search(r"(?:근거|이유|풀이|과정|설명)(?:도|까지)\b|답만[^.!?]{0,18}지\s*말고", question):
         return False
-    return bool(re.search(r"(?:정답만|답만|한\s*단어로만)(?=\s*(?:알려|말해|적어|써|부탁|[.!?]|$))"
+    return bool(re.search(r"(?:정답만|답만|한\s*단어로만)(?=\s*(?:간단히|알려|말해|적어|써|부탁|요\b|[.!?]|$))"
                           r"|(?:설명|해설|풀이)\s*없이", question))
 
 
-async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_only: bool) -> tuple[str | None, bool, str]:
+async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_only: bool,
+                        *, question: str = "") -> tuple[str | None, bool, str]:
     import httpx
     from src.api.script_guard import has_foreign, strip_foreign
 
-    payload = ollama_request(prompt, max_tokens=165 if OLLAMA_CPU else 300)
+    payload = ollama_request(prompt, max_tokens=140 if OLLAMA_CPU else 300)
     payload.update(system=tutor_instruction(subject), format=_SCHEMA)
     payload["options"]["temperature"] = 0.1
     try:
@@ -191,10 +250,10 @@ async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_o
             result = await generate(payload)
             answer, grounded, kind = read_answer(
                 result.get("response"), has_reference,
-                length_limited=result.get("done_reason") == "length", answer_only=answer_only)
+                length_limited=result.get("done_reason") == "length", answer_only=answer_only, question=question)
             if not answer:
                 logging.info("[AI 질문] JSON 응답 재생성: 종료=%s", result.get("done_reason"))
-                answer = await _plain_retry(generate, prompt, answer_only)
+                answer = await _plain_retry(generate, prompt, answer_only, question)
         if answer and has_foreign(answer):
             answer = strip_foreign(answer).strip()
         return (answer, grounded, kind) if answer else _NO_ANSWER
@@ -203,10 +262,11 @@ async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_o
         return _NO_ANSWER
 
 
-async def _plain_retry(generate, prompt: str, answer_only: bool) -> str | None:
+async def _plain_retry(generate, prompt: str, answer_only: bool, question: str = "") -> str | None:
     instruction = ("학생의 교과 질문에 바로 답하세요. 한국어를 사용하고 영어 예문과 수식은 그대로 씁니다. "
                    "질문의 조건이 부족하면 필요한 조건을 묻고, 확인할 수 없는 사실을 지어내지 않습니다. ")
-    instruction += "정답만 짧게 쓰세요." if answer_only else "결론과 그 이유를 한두 문장으로 쓰세요."
+    instruction += ("첫 줄에 정답만 짧게 쓰세요." if answer_only else
+                    "첫 줄에 결론을 쓰고, 다음 줄에 그 판단에 쓴 단서와 의미 또는 중간 계산식을 쓰세요.")
     retry = ollama_request(prompt, max_tokens=95 if OLLAMA_CPU else 170)
     retry.update(system=instruction)
     retry["options"]["temperature"] = 0
@@ -222,4 +282,17 @@ async def _plain_retry(generate, prompt: str, answer_only: bool) -> str | None:
         if not endings:
             return None
         text = text[:endings[-1].end()]
-    return strip_chat_frame(strip_markdown(text))
+    lines = strip_chat_frame(strip_markdown(text)).splitlines()
+    answer = re.sub(r"^(?:답변|정답)\s*[:：]\s*", "", lines[0]) if lines else ""
+    if not answer or len(lines) < 2:
+        return answer or None
+    rest = "\n".join(lines[1:]).strip()
+    reason_label = r"^(?:근거|풀이|설명)\s*[:：]\s*"
+    if answer_only:
+        # A list of requested answers may need several lines. Only remove a
+        # separately labelled explanation when its role can be identified.
+        extra_answers = re.split(reason_label, rest, maxsplit=1, flags=re.MULTILINE)[0].rstrip()
+        return "\n".join(filter(None, (answer, extra_answers)))
+    reason = re.sub(reason_label, "", rest)
+    explanation = _explanation(answer, reason, question)
+    return f"{answer}\n{explanation}" if explanation else answer

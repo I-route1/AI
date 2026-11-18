@@ -78,10 +78,11 @@ def solve_linear(question: str, *, answer_only: bool = False) -> str | None:
     reduced = f"{_coefficient(factor, variable)} = {difference}"
     if factor == 0:
         result = "모든 실수가 해입니다." if difference == 0 else "해가 없습니다."
-        reason = f"양변에서 같은 항을 소거하면 {reduced}이 됩니다."
+        reason = f"양변에서 같은 항을 소거한 식은 {reduced}입니다."
     else:
         result = f"{variable} = {difference / factor}"
         reason = f"미지수항을 왼쪽에, 상수항을 오른쪽에 모으면 {reduced}입니다."
         if factor != 1:
-            reason += f" 양변을 같은 계수로 나누면 {variable} = {difference} ÷ ({factor}) = {difference / factor}입니다."
+            divisor = str(factor) if factor.denominator == 1 and factor > 0 else f"({factor})"
+            reason += f"\n계수로 양변을 나눕니다. {variable} = {difference} ÷ {divisor} = {difference / factor}"
     return result if answer_only else f"{result}\n{reason}"
