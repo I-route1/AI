@@ -37,7 +37,7 @@ from src.api.adapters import (
     MATH_SYSTEM_PROMPT, SUBJECT_ADAPTERS,
 )
 from src.api.routers import counseling, predictor, writing, rag
-from src.api.routers.counseling import _material_lines, _report_ollama
+from src.api.routers.counseling import _material_lines, _report_ollama, _report_prompt, _study_guide
 from src.api.generation import ADVICE_GEN, CONCEPT_GEN, ollama_request
 from src.api.postprocess import strip_chat_frame, strip_markdown, trim_cut_tail
 from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
@@ -45,7 +45,7 @@ from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_
 from transformers import LogitsProcessorList
 from src.api.routers.rag import subject_aware_search as _subject_aware_search
 from src.api.java_client import get_student_weakness_from_java
-from src.api.grounding import concept_user_message, context_block
+from src.api.grounding import concept_user_message
 
 app = FastAPI(title="iRoute AI Server", default_response_class=UTF8JSONResponse)
 
@@ -166,17 +166,6 @@ _SUBJECT_DEFAULT_CONCEPT: dict[str, str] = {
     "과학":   "기본 과학 개념",
     "사회":   "사회 기본 개념",
 }
-
-_SUBJECT_STRATEGY: dict[str, list[str]] = {
-    "수학":   ["교과서 개념 정리 및 공식 확인", "관련 기출 예제 5문항 풀이", "오답 원인 분석 후 재풀이", "유사 문제 추가 풀이로 확인"],
-    "영어":   ["핵심 어법 규칙 정리", "관련 지문 구문 분석", "어휘 정리 및 암기", "유형별 문제 반복 풀이"],
-    "국어":   ["지문 구조 파악 훈련", "핵심 주장 및 근거 추출 연습", "어휘·표현 정리", "유사 지문 독해 연습"],
-    "과학":   ["개념 원리 이해 및 정리", "관련 실험·현상 사례 확인", "공식·법칙 적용 연습", "단원 마무리 문제 풀이"],
-    "사회":   ["핵심 개념·용어 정리", "관련 사례 및 사료 확인", "개념 간 연관성 파악", "기출 문제 풀이"],
-}
-
-
-
 
 # 개념 설명에서 어댑터를 끄고 베이스로 생성할 과목.
 #
@@ -416,36 +405,27 @@ async def generate_subject_recommendation(
     rag_docs = await run_in_threadpool(_subject_aware_search, subject, concept_query, k=3)
     rag_text = _material_lines(rag_docs, observed)
 
-    steps = _SUBJECT_STRATEGY.get(subject, [
-        "개념 정리 및 확인", "관련 예제 풀이", "오답 분석", "추가 문제로 실력 확인"
-    ])
-    strategy = "\n".join(f"{i+1}단계 — {s}" for i, s in enumerate(steps))
-
     if observed:
         report = f"[{subject} 취약 개념 학습 가이드]\n\n● 집중 학습 개념: {concept_query}\n"
     else:
         report = f"[{subject} 복습 시작 가이드]\n\n개인별 취약 개념 기록이 없어 {concept_query}부터 안내합니다.\n"
     if rag_text:
-        report += f"\n[관련 학습 자료]\n{rag_text}\n"
-    report += f"\n[학습 전략]\n{strategy}\n\n확인 활동: ‘{concept_query}’ 예제 하나를 골라 사용한 원리를 한 문장으로 설명하세요."
+        report += f"\n[교과 자료]\n{rag_text}\n"
 
     # 베이스 Qwen으로 생성하고, _concept_explain()이 None을 주는 과목만 Ollama로 넘긴다.
     # GPU 생성은 수 초가 걸리는 블로킹 작업이라 threadpool로 빼서 이벤트 루프를 막지 않는다.
-    llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query, rag_docs) if observed else None
+    prompt = _report_prompt(subject, concept_query, rag_docs) if observed else ""
+    llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query, rag_docs, prompt) if observed else None
     if llm_insight:
         fallback_stats.record("concept", "qwen")
 
     if observed and not llm_insight:
-        prompt = (
-            f"{context_block(rag_docs)}"
-            f"{subject} 과목에서 '{concept_query}' 개념을 어려워하는 학생에게 "
-            f"이 개념의 핵심 포인트와 효과적인 학습 방법을 2~3문장으로 한국어로 답해주세요."
-        )
         llm_insight = await _report_ollama(prompt)
         fallback_stats.record("concept", "ollama" if llm_insight else "none")
 
     if llm_insight:
-        report += f"\n\n[AI 개념 분석]\n{llm_insight}"
+        report += f"\n[AI 개념 설명]\n{llm_insight}\n"
+    report += "\n" + _study_guide(subject, concept_query, rag_text)
 
     return {
         "studentId": student_id,

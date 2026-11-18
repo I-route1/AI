@@ -28,8 +28,8 @@ def classify_quoted_figure(question: str, references: list[str], answer_only: bo
         # can also be literal. The marker alone cannot establish a literary device.
         if re.search(r"평소|어제|예전|전날|오늘|어릴때|작년|저번|그때|옛날|엄마|아빠|아버지|어머니|형|누나|언니|선생님|친구|동생", image):
             return None
-        reason = f"‘{image}처럼’에서 ‘처럼’이 두 대상을 연결합니다. ‘{topic}’의 모습을 ‘{image}’에 빗댔습니다."
-        return "직유법입니다." if answer_only else "직유법입니다. " + reason
+        reason = f"‘{image}처럼’의 ‘처럼’이 비교를 드러냅니다. 이 표현으로 두 대상(‘{topic}’, ‘{image}’)의 공통점을 보여 줍니다."
+        return "직유법입니다." if answer_only else "직유법입니다.\n" + reason
     # A literal identity can use exactly the same grammar. Only apply the rule when
     # the exercise itself says a figurative meaning was expressed in this line.
     if not re.search(r"(?:을|를)\s*(?:표현한|나타낸|빗댄|비유한)\s*비유법", task):
@@ -37,5 +37,5 @@ def classify_quoted_figure(question: str, references: list[str], answer_only: bo
     identity = _IDENTITY.fullmatch(sample)
     if identity:
         reason = f"‘{sample}’에서는 ‘처럼’ 같은 비교 표현을 쓰지 않고 두 대상(‘{identity['topic']}’, ‘{identity['image']}’)을 같은 것으로 나타냈습니다."
-        return "은유법입니다." if answer_only else "은유법입니다. " + reason
+        return "은유법입니다." if answer_only else "은유법입니다.\n" + reason
     return None

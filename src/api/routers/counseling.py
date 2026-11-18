@@ -12,34 +12,16 @@ from src.api.concept_map import search_concept_map
 from src.api.generation import OLLAMA_CPU, OLLAMA_URL, ollama_request
 from src.api.java_client import get_student_weakness_from_java
 from src.api.grounding import context_block, is_curated
-from src.api.postprocess import strip_markdown
+from src.api.postprocess import strip_chat_frame, strip_markdown
 from src.api.report_text import complete_generation, material_excerpt, positive_measurement
 from src.api.script_guard import has_foreign, strip_foreign
 from src.api.routers.rag import detect_subject, subject_aware_search, vector_search, _SUBJECT_KEYWORDS
 
 router = APIRouter()
 
-# 과목별 기본 검색어 (recommendContext 없을 때 RAG 검색 폴백용)
-_DEFAULT_QUERY = {
-    "수학":   "방정식 함수 기본 개념",
-    "영어":   "구문 독해 어법 기본",
-    "국어":   "문학 독해 언어 능력",
-    "과학":   "물리 화학 생물 기본 개념",
-    "사회":   "사회 역사 지리 기본 개념",
-}
-
-# 과목별 오답 유형 (수학 외 과목에서 "계산 실수" 대신 쓸 표현)
-_MISTAKE_TYPES = {
-    "수학":   "계산 실수 / 개념 미이해 / 응용력 부족",
-    "영어":   "어휘·문법 실수 / 구문 해석 오류 / 추론력 부족",
-    "국어":   "어휘력 부족 / 지문 구조 파악 실패 / 선지 함정 오독",
-    "과학":   "개념 혼동 / 단위·계산 실수 / 실험 해석 오류",
-    "사회":   "암기 부족 / 개념 간 혼동 / 자료 해석 오류",
-}
-
 _REVIEW_ACTIVITY = {
     "수학": "예제의 조건 하나를 바꾸어 다시 풀고, 그 조건이 어느 풀이 단계에 영향을 줬는지 표시하세요.",
-    "영어": "예문에서 핵심 표현에 밑줄을 긋고, 그 표현을 써서 다른 문장을 만드세요.",
+    "영어": "예문에서 핵심 표현에 밑줄을 긋고, 그 표현을 써서 새 문장을 하나 만드세요.",
     "국어": "지문에서 개념을 보여 주는 구절을 골라, 그 구절이 해석의 근거가 되는 이유를 적으세요.",
     "과학": "교과서에서 이 개념이 나타나는 현상 하나를 찾아, 관찰할 수 있는 변화와 그 원인을 나누어 적으세요.",
     "사회": "사례 하나를 골라 개념의 정의에 해당하는 부분을 표시하고, 둘이 어떻게 연결되는지 적으세요.",
@@ -57,7 +39,30 @@ def _review_activity(subject: str, concept: str, materials: str) -> str:
             if len(years) >= 2:
                 return (f"{focus} 자료에서 {years[0]}과 {years[1]}에 해당하는 내용을 각각 찾아, "
                         "두 기록의 차이를 한 문장으로 설명해 보세요.")
-    return f"{focus} 복습 활동: {_REVIEW_ACTIVITY[subject]}"
+    return _REVIEW_ACTIVITY.get(subject, "교과서 예제를 한 문제 풀고 풀이에 사용한 개념을 표시하세요.")
+
+
+_SELF_CHECK = {
+    "수학": "바꾼 조건과 그대로인 조건을 구분하고, 풀이에서 달라진 줄을 짚을 수 있나요?",
+    "영어": "새 문장을 소리 내어 읽고, 밑줄 친 표현이 어떤 뜻을 더하는지 설명할 수 있나요?",
+    "국어": "자신의 해석을 뒷받침하는 구절을 지문에서 다시 찾을 수 있나요?",
+    "과학": "직접 관찰한 사실과 그것을 설명하는 원리를 구분해서 말할 수 있나요?",
+    "사회": "자료에 나온 표현 하나를 짚어 자신의 설명을 뒷받침할 수 있나요?",
+}
+
+
+def _study_guide(subject: str, concept: str, materials: str) -> str:
+    focus = f"‘{concept}’" if concept else "최근 배운 단원"
+    check = _SELF_CHECK.get(subject, "답을 고른 근거를 한 문장으로 말할 수 있나요?")
+    return (f"[학습 전략]\n1단계 — {focus}의 예제 한 문제를 풀고 답을 고른 근거를 한 문장으로 적으세요.\n"
+            f"2단계 — {_review_activity(subject, concept, materials)}\n\n[스스로 확인]\n{check}")
+
+
+def _report_prompt(subject: str, concept: str, docs: list[str]) -> str:
+    return (f"{context_block(docs)}"
+            f"{subject} '{concept}'을 복습하는 학생에게, 원리 하나를 쉬운 말로 설명하고 "
+            "짧은 예에서 그 원리를 어떻게 확인하는지 보여 주세요. "
+            "학생의 실제 오답이나 습관을 추정하지 마세요. 같은 조언을 되풀이하지 마세요.")
 
 
 async def _ollama_once(client: httpx.AsyncClient, prompt: str, timeout: float,
@@ -71,6 +76,8 @@ async def _ollama_once(client: httpx.AsyncClient, prompt: str, timeout: float,
     if r.status_code == 200:
         payload = r.json()
         result = (payload.get("response") or "").strip()
+        if re.search(r"</?think\b|<\|im_(?:start|end)\|>", result, re.IGNORECASE):
+            return None
         if payload.get("done_reason") == "length":
             return complete_generation(result) or None
         return result
@@ -94,7 +101,7 @@ async def _ollama_analyze(prompt: str, timeout: float = 20.0, *,
                 retry = await _ollama_once(client, prompt, timeout, max_tokens) if retry_foreign else None
                 text = retry if retry and not has_foreign(retry) else strip_foreign(retry or text).strip()
             # Qwen 개념 설명과 같은 정리 — 리포트에 "**굵게**" 기호가 그대로 보였다.
-            return strip_markdown(text) if text else text
+            return strip_chat_frame(strip_markdown(text)) if text else text
     except Exception as e:
         logging.warning(f"[Ollama] 연결 실패: {e}")
     return None
@@ -106,7 +113,7 @@ async def _report_ollama(prompt: str) -> str | None:
     # CPU에서 기존 400토큰 요청은 대개 20초 제한을 넘겼다. Java의 50초 한도 안에
     # 한 번만 요청하고, 교과 근거와 다음 학습 행동 하나에 집중한다.
     return await _ollama_analyze(
-        prompt + "\n한국어로 두 문장 이내로 쓰세요. 첫 문장에 핵심, 다음 문장에 직접 해 볼 활동 하나를 담으세요.",
+        prompt + "\n한국어 두 문장 이내로 핵심을 먼저 쓰고, 이어서 요청한 예나 확인 방법을 보여 주세요.",
         timeout=35.0, max_tokens=106, retry_foreign=False,
     )
 
@@ -189,25 +196,25 @@ def _resolve_concept(subject: str, req: dict) -> str:
     return ""
 
 
-def _material_lines(docs: list[str], concept: str, width: int = 420) -> str:
-    """리포트의 '관련 학습 자료' 줄. 개념을 특정하지 못해 기본 검색어로 찾은 경우에는
-    ConceptMap 자료만 보여 준다 — FAISS 교과서 조각은 "Use the phrases from the
-    vocabulary list." 같은 문장이라 학생에게 의미가 없다."""
-    notes = []
+def _material_lines(docs: list[str], concept: str, width: int = 145) -> str:
+    """Show one readable source passage tied to the concept. Keep the full documents for inference."""
+    target = "".join(concept.split()).casefold()
     for doc in docs:
-        if not doc or doc.startswith(("검색 오류", "검색 실패")) or not (concept or is_curated(doc)):
+        if not doc or doc.startswith(("검색 오류", "검색 실패")):
             continue
-        excerpt = material_excerpt(doc, width)
-        if excerpt and excerpt not in notes:
-            notes.append(excerpt)
-    return "\n".join(f"  • {note}" for note in notes)
+        if not is_curated(doc) and (not target or target not in "".join(doc.split()).casefold()):
+            continue
+        excerpt = material_excerpt(doc, width, concept)
+        if excerpt:
+            return f"• {excerpt}"
+    return ""
 
 
 # writing·premium의 학습 조언 프롬프트 공통 지시. 예전 프롬프트는 질문을 되풀이하며 시작해
 # 번호 목록에 같은 말을 맴돌았다("개념을 이해하기 위해 노력하는 동안, 개념을 이해하기 위한
 # 노력을 통해…"). 학생 4명 프로필로 비교해 이 지시가 짧고 구체적인 조언을 냈다.
-_ADVICE_RULES = (" 학생에게 직접 말하듯 3문장 이내로 쓰세요. 각 방법에는 무엇을 얼마나 자주 할지 넣으세요."
-                 " 질문을 되풀이하지 말고 목록 기호 없이 문장으로만 쓰세요.")
+_ADVICE_RULES = (" 학생이 바로 할 수 있는 활동 한 가지와 스스로 확인할 기준 한 가지를 두 문장으로 쓰세요."
+                 " 학생 기록에 없는 능력·진로·오답을 추정하지 마세요.")
 
 
 def _feedback_clause(req: dict) -> str:
@@ -227,10 +234,10 @@ def _math_report(req: dict, concept: str) -> tuple[dict, list[str]]:
 
 def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[str]]:
     percentile, basis = _level_basis(subject, req)
-    rag_docs = subject_aware_search(subject, concept or _DEFAULT_QUERY[subject], k=3)
+    rag_docs = subject_aware_search(subject, concept, k=3) if concept else []
     rag_text = _material_lines(rag_docs, concept)
     analysis = (
-        f"[{subject} 사고력 및 오답 패턴 분석]\n\n"
+        "[기록으로 본 학습]\n"
         f"● 현재 학업 수준: {_grade_description(percentile, basis)}\n"
         f"● 기록된 학습 시간: {_study_time(req)}\n"
     )
@@ -240,32 +247,23 @@ def _subject_report(subject: str, req: dict, concept: str) -> tuple[dict, list[s
     if feedback := req.get("instructorFeedback"):
         analysis += f"● 최근 강사 피드백: {feedback}\n"
     if concept:
-        analysis += f"\n[취약 개념 집중 분석]\n{concept}\n"
+        analysis += f"● 복습할 개념: {concept}\n"
     if rag_text:
-        analysis += f"\n[관련 학습 자료 검색 결과]\n{rag_text}\n"
+        analysis += f"\n[교과 자료]\n{rag_text}"
 
     hours = positive_measurement(req.get("studyTime"), 24)
-    target = f"‘{concept}’" if concept else "최근 배운 단원"
-    practice = f"{target}의 예제 한 문제를 풀고, 답을 고른 근거를 한 문장으로 적어 보세요."
-    check = _review_activity(subject, concept, rag_text)
+    guide = _study_guide(subject, concept, rag_text)
     if percentile is None:
-        check += " 다음 시험 성적을 등록한 뒤 같은 개념의 풀이를 비교하세요."
+        guide += "\n다음 시험 성적을 등록하면 이번 복습에서 다룬 단원의 변화를 함께 살펴보세요."
     elif percentile >= 75:
-        check += " 처음 보는 예에도 같은 원리를 적용할 수 있는지 확인하세요."
+        guide += "\n익숙해지면 새 예에서도 같은 원리를 찾아보세요."
     elif percentile < 50:
-        check += " 막히면 교과서의 첫 예제를 펼쳐 해당 설명을 다시 찾아보세요."
-    guide = (
-        f"[{subject} 맞춤 학습 전략]\n\n"
-        f"1단계 — 교과서나 관련 자료를 읽고 {target}의 핵심을 자신의 말로 정리하세요.\n"
-        f"2단계 — {practice}\n"
-        f"3단계 — 오답의 원인을 다음 항목과 비교하세요. {_MISTAKE_TYPES[subject]}.\n"
-        f"4단계 — 다음 학습에서 점검할 내용: {check}\n"
-    )
+        guide += "\n막히면 교과서의 첫 예제와 자신의 풀이를 한 줄씩 대조하세요."
     if hours is not None:
         minutes = round(hours * 60)
         if minutes >= 2:
             session = min(20, minutes)
-            guide += f"\n다음 복습 예시: 기록된 하루 {minutes}분 중 {session}분을 이 활동에 사용해 보세요."
+            guide += f"\n\n[복습 시간 예시]\n기록된 하루 {minutes}분 중 {session}분을 이 활동에 사용해 보세요."
     return {
         "studentId": req.get("studentId", ""),
         "title": f"{subject} 메타인지 분석 리포트",
@@ -278,16 +276,15 @@ def _writing_report(req: dict, concept: str) -> dict:
     student_id    = req.get("studentId", "")
     percentile, basis = _level_basis("국어", req)
     student_note  = req.get("studentNote") or ""
-    recommend_ctx = req.get("recommendContext") or ""
     feedback      = req.get("instructorFeedback") or ""
 
     # RAG로 국어 관련 학습 자료 검색 (과목 필터 적용). recommendContext는 보통 수준 라벨이라
     # 검색어로 쓰지 않고 _resolve_concept()로 정한 개념을 쓴다.
-    rag_docs  = subject_aware_search("국어", concept or _DEFAULT_QUERY["국어"], k=3)
+    rag_docs  = subject_aware_search("국어", concept, k=3) if concept else []
     rag_text  = _material_lines(rag_docs, concept)
 
     career_analysis = (
-        f"[언어·작문 역량 및 진로 적합성 분석]\n\n"
+        "[기록으로 본 학습]\n"
         f"● 국어 학업 수준: {_grade_description(percentile, basis)}\n"
         f"● 기록된 학습 시간: {_study_time(req)}\n"
     )
@@ -295,32 +292,30 @@ def _writing_report(req: dict, concept: str) -> dict:
         career_analysis += f"● 학습 성향 및 특성: {student_note}\n"
     if feedback:
         career_analysis += f"● 강사 관찰 소견: {feedback}\n"
-    if recommend_ctx:
-        career_analysis += f"\n[학습 방향]\n{recommend_ctx}\n"
+    career_analysis += _direction_line(req, concept)
+    if concept:
+        career_analysis += f"● 복습할 개념: {concept}\n"
     if rag_text:
-        career_analysis += f"\n[관련 학습 자료 검색 결과]\n{rag_text}\n"
+        career_analysis += f"\n[교과 자료]\n{rag_text}"
 
-    if percentile is None:
-        guide_focus = "짧은 지문에서 글쓴이의 주장과 근거를 찾아 현재 독해 수준 확인"
-    elif percentile >= 80:
-        guide_focus = "심화 독해 + 논술 + 다양한 장르 글쓰기 경험"
-    elif percentile >= 60:
-        guide_focus = "비문학 독해 강화 + 핵심 주장 파악 훈련"
+    if concept:
+        reading_task = f"교과서에서 ‘{concept}’을 다룬 지문을 골라, 판단 근거가 되는 구절에 밑줄을 그으세요."
     else:
-        guide_focus = "어휘력 확장 + 단문 요약 훈련부터 시작"
+        reading_task = "짧은 글 한 편에서 글쓴이가 전하려는 말을 한 문장으로 적고, 근거가 되는 구절에 밑줄을 그으세요."
+    if percentile is not None and percentile >= 80:
+        writing_check = "같은 구절을 다르게 읽을 수도 있나요? 두 해석 중 어느 쪽을 지문이 더 잘 뒷받침하는지 설명하세요."
+    elif percentile is not None and percentile < 50:
+        writing_check = "인용한 구절에서 가장 중요한 낱말을 고르고, 그 뜻을 자신의 말로 풀어 쓸 수 있나요?"
+    else:
+        writing_check = "인용한 내용과 자신의 해석을 구별해서 읽어 줄 수 있나요?"
 
     learning_guide = (
-        f"[진로 맞춤 언어 학습 전략]\n\n"
-        "● 진로 탐색 활동: 관심 있는 주제를 하나 골라 짧은 기사나 설명문을 써 보세요. "
-        "자료 조사, 인터뷰, 문장 다듬기 중 어떤 과정이 재미있었는지 기록하세요.\n\n"
-        f"● 핵심 역량 강화 방향: {guide_focus}\n\n"
-        f"주간 학습 계획:\n"
-        f"  - 월·수·금: 비문학 지문 1편 정독 + 핵심어 3개 추출\n"
-        f"  - 화·목: 문학 작품 1편 감상 + 서술자 시점 분석\n"
-        f"  - 주말: 500자 자유 글쓰기 + 자기 평가\n"
+        f"[이번 복습]\n1단계 — {reading_task}\n"
+        "2단계 — 표시한 구절을 인용해 자신의 해석을 두 문장으로 쓰세요.\n\n"
+        f"[스스로 확인]\n{writing_check}\n\n"
+        "[진로 탐색]\n관심 있는 주제로 기사를 쓴다면 자료 조사, 인터뷰, 문장 다듬기 중 "
+        "어느 일을 먼저 해 보고 싶은지 이유를 적어 보세요."
     )
-
-    # writing 어댑터는 글쓰기 평가 특화 파인튜닝으로 진로 조언 프롬프트에 부적합 — LLM 미사용
 
     return {
         "studentId": student_id,
@@ -344,7 +339,7 @@ def _premium_report(req: dict, concept: str) -> dict:
     subject = _premium_subject(req)
     percentile, basis = _level_basis(subject, req)
     analysis = (
-        "[i-Route 프리미엄 종합 학습 진단]\n\n"
+        "[기록으로 본 학습]\n"
         f"● 학업 수준: {_grade_description(percentile, basis)}\n"
         f"● 기록된 학습 시간: {_study_time(req)}\n"
     )
@@ -354,18 +349,17 @@ def _premium_report(req: dict, concept: str) -> dict:
         analysis += f"● 최근 강사 피드백: {feedback}\n"
     analysis += _direction_line(req, concept)
     if concept:
-        analysis += f"\n[취약 영역 집중 진단]\n{subject} · {concept}\n"
+        analysis += f"● 복습할 개념: {subject} · {concept}\n"
         docs = subject_aware_search(subject, concept, k=3)
         if material := _material_lines(docs, concept):
-            analysis += f"\n[관련 학습 자료]\n{material}\n"
+            analysis += f"\n[교과 자료]\n{material}"
 
     focus = f"{subject} ‘{concept}’" if concept else "복습할 단원 한 가지"
     strategy = (
-        f"[프리미엄 맞춤 전략 리포트]\n\n"
-        f"이번 주에는 {focus}에 집중하세요.\n"
-        "첫날 — 교과서 예제 한 문제를 풀고 어떤 개념을 썼는지 적으세요.\n"
-        "다음 학습일 — 답안을 가리고 같은 원리를 쓰는 다른 문제를 풀어 보세요.\n"
-        "주말 — 두 풀이를 비교하고, 혼자 설명하기 어려운 단계 하나를 강사에게 질문하세요.\n"
+        f"[이번 주 복습]\n1단계 — {focus}의 교과서 예제 한 문제를 풀고 사용한 개념에 표시하세요.\n"
+        "2단계 — 다음 학습일에 답안을 가리고 같은 원리가 쓰이는 다른 문제를 풀어 보세요.\n\n"
+        "[스스로 확인]\n두 풀이에서 같은 원리를 적용한 부분을 찾을 수 있나요? "
+        "막힌 단계가 있으면 그 줄에 표시해 강사에게 질문하세요."
     )
     if feedback:
         strategy += "\n강사 피드백에서 요청한 내용을 풀이 옆에 표시하고 다음 수업에서 확인하세요."
@@ -382,15 +376,10 @@ async def report_math(req: dict):
     concept = await run_in_threadpool(_resolve_concept, "수학", req)
     result, rag_docs = await run_in_threadpool(_math_report, req, concept)
     if concept:
-        prompt = (
-            f"{context_block(rag_docs)}"
-            f"한국 중고등학생이 수학 '{concept}' 개념을 어려워합니다. "
-            f"이 개념에서 학생들이 가장 자주 하는 핵심 실수 1가지와 "
-            f"그것을 극복하는 구체적인 학습 전략을 2~3문장으로 간결하게 한국어로 답해주세요."
-        )
+        prompt = _report_prompt("수학", concept, rag_docs)
         llm_insight = await _advice(prompt, "수학")
         if llm_insight:
-            result["careerAnalysis"] += f"\n\n[AI 개념 심층 분석]\n{llm_insight}"
+            result["careerAnalysis"] += f"\n\n[AI 개념 설명]\n{llm_insight}"
     return result
 
 
@@ -403,11 +392,11 @@ async def report_writing(req: dict):
     prompt = (
         f"성적 정보: {basis}. 학습 시간: {_study_time(req)}. "
         f"학생 특성: '{note or '특이사항 없음'}'.{_feedback_clause(req)} "
-        f"이 학생의 국어(문학·비문학·작문) 실력을 올릴 구체적인 공부 방법 2가지를{_ADVICE_RULES}"
+        f"이번에 연습할 국어 개념: {concept or '지문 읽기와 글쓰기'}. {_ADVICE_RULES}"
     )
     llm_insight = await _advice(prompt, "국어")
     if llm_insight:
-        result["careerAnalysis"] += f"\n\n[AI 맞춤 학습 제안]\n{llm_insight}"
+        result["learningGuide"] += f"\n\n[AI 복습 제안]\n{llm_insight}"
     return result
 
 
@@ -422,11 +411,11 @@ async def report_premium(req: dict):
     prompt = (
         f"학생 정보 — {basis}, 학습 시간: {_study_time(req)}. {direction}"
         f"취약 개념: '{concept or '특정되지 않음'}', 특성: '{note or '없음'}'.{_feedback_clause(req)} "
-        f"이 학생이 성적을 올리려면 이번 주에 가장 먼저 해야 할 행동 2가지를{_ADVICE_RULES}"
+        f"이번 주 복습 중 먼저 할 일을 제안하세요. {_ADVICE_RULES}"
     )
     llm_insight = await _advice(prompt, _premium_subject(req))
     if llm_insight:
-        result["careerAnalysis"] += f"\n\n[AI 우선순위 행동 제안]\n{llm_insight}"
+        result["learningGuide"] += f"\n\n[AI 복습 제안]\n{llm_insight}"
     return result
 
 
@@ -444,25 +433,20 @@ async def report_subject(subject: str, req: dict):
         # TestClient로 라우터만 띄운 경우처럼 미등록이면 곧바로 Ollama로 넘어간다.
         # rag_docs는 concept으로 검색한 것이다.
         llm_insight = None
+        prompt = _report_prompt(subject, concept, rag_docs)
         concept_explain = model_registry.get("concept_explain")
         if concept_explain:
-            llm_insight = await run_in_threadpool(concept_explain, subject, concept, rag_docs)
+            llm_insight = await run_in_threadpool(concept_explain, subject, concept, rag_docs, prompt)
             if llm_insight:
                 fallback_stats.record("concept", "qwen")
 
         # 2순위: _concept_explain()이 None을 준 경우(생성 실패) Ollama
         if not llm_insight:
-            prompt = (
-                f"{context_block(rag_docs)}"
-                f"한국 중고등학생이 {subject} '{concept}' 개념을 어려워합니다. "
-                f"이 개념에서 학생들이 가장 자주 하는 핵심 실수 1가지와 "
-                f"그것을 극복하는 구체적인 학습 전략을 2~3문장으로 간결하게 한국어로 답해주세요."
-            )
             llm_insight = await _report_ollama(prompt)
             fallback_stats.record("concept", "ollama" if llm_insight else "none")
 
         if llm_insight:
-            result["careerAnalysis"] += f"\n\n[AI 개념 심층 분석]\n{llm_insight}"
+            result["careerAnalysis"] += f"\n\n[AI 개념 설명]\n{llm_insight}"
     return result
 
 
@@ -530,14 +514,14 @@ async def ai_ask(req: dict):
         qwen_prompt = (f'{tutor_instruction(subject)}\n{{"근거":"…","답변":"…","유형":"…"}} '
                        f'형식의 JSON으로 반환하세요.\n\n{prompt}')
         generated = await run_in_threadpool(concept_explain, subject, question, docs, qwen_prompt)
-        answer, grounded, kind = read_answer(generated, has_reference, answer_only=answer_only)
+        answer, grounded, kind = read_answer(generated, has_reference, answer_only=answer_only, question=question)
         if answer:
             fallback_stats.record("ask", "qwen")
     if not answer:
-        answer, grounded, kind = await ollama_answer(subject, prompt, has_reference, answer_only)
+        answer, grounded, kind = await ollama_answer(subject, prompt, has_reference, answer_only, question=question)
         fallback_stats.record("ask", "ollama" if answer else "none")
-    if answer and kind == "answer" and not answer_only:
-        answer, cited = verify_reported_claim(subject, question, answer)
+    if kind == "answer" and not answer_only:
+        answer, cited = verify_reported_claim(subject, question, answer, docs)
         grounded = grounded or cited
     return {"subject": subject, "question": question, "answer": answer, "grounded": grounded,
             "needSubject": False, "answerKind": kind}

@@ -59,18 +59,24 @@ class ReportFactsTest(TestCase):
         self.assertEqual(7, result["studentId"])
         self.assertIn("영어 백분위 71.5%", result["careerAnalysis"])
         self.assertIn(req["instructorFeedback"], result["careerAnalysis"])
-        self.assertIn("미래 will be done", result["careerAnalysis"])
+        self.assertIn("과거분사", result["careerAnalysis"])
+        self.assertNotIn("5형식", result["careerAnalysis"])
+        self.assertIn("[스스로 확인]", result["learningGuide"])
         self.assertTrue(result["careerAnalysis"].strip().endswith("."))
         self.assertIn("‘수동태’의 예제 한 문제", result["learningGuide"])
         self.assertIn("15분 중 15분", result["learningGuide"])
         self.assertNotIn("부족로", result["learningGuide"])
 
     def test_social_science_excerpt_and_legitimate_error_topic(self):
-        for subject, concept in [("사회", "훈민정음"), ("과학", "응결")]:
+        for subject, concept, example in [("사회", "훈민정음", "1446년"), ("과학", "응결", "물방울")]:
             docs = search_concept_map(subject, concept, 1)
             with self.subTest(subject=subject):
                 self.assertTrue(docs)
-                self.assertIn(docs[0], counseling._material_lines(docs, concept))
+                excerpt = counseling._material_lines(docs, concept).removeprefix("• ")
+                self.assertIn(excerpt, docs[0])
+                self.assertIn(concept, excerpt)
+                self.assertIn(example, excerpt)
+                self.assertLessEqual(len(excerpt), 145)
         self.assertIn("표집 오류", counseling._material_lines(["표집 오류가 발생할 수 있다.", "검색 오류: timeout"], "표집"))
         self.assertEqual("자료를 읽습니다.", material_excerpt("자료를 읽습니다. " + "가나다"*20, 20))
 
@@ -81,13 +87,21 @@ class ReportFactsTest(TestCase):
         self.assertIn("과학 ‘운동량’", result["learningGuide"])
         self.assertNotIn("99%", result["learningGuide"])
 
+    def test_writing_uses_different_checks_with_the_same_observed_concept(self):
+        guides = [counseling._writing_report({"subjectPercentile": percentile}, "비유")["learningGuide"]
+                  for percentile in (40, 65, 81)]
+        self.assertTrue(all("비유" in guide for guide in guides))
+        self.assertIn("낱말", guides[0])
+        self.assertIn("자신의 해석", guides[1])
+        self.assertIn("두 해석", guides[2])
+
     def test_history_activity_uses_dates_shown_in_this_units_source(self):
         for concept, docs, expected in (
                 ("훈민정음", search_concept_map("사회", "훈민정음", 1), ("1443년", "1446년")),
                 ("선거 제도", ["선거 제도 자료에 1948년과 1987년의 사례가 실려 있다."], ("1948년", "1987년"))):
             with self.subTest(concept=concept), patch.object(counseling, "subject_aware_search", return_value=docs):
                 result, _ = counseling._subject_report("사회", {"subjectPercentile": 82}, concept)
-                step = result["learningGuide"].split("4단계")[1]
+                step = result["learningGuide"].split("2단계")[1]
                 for term in (concept, *expected, "두 기록의 차이"):
                     self.assertIn(term, step)
                 self.assertNotIn("시사 이슈", step)
@@ -98,8 +112,8 @@ class ReportFactsTest(TestCase):
             with self.subTest(subject=subject), patch.object(counseling, "subject_aware_search",
                     return_value=["다른 단원에 1443년과 1446년이 나온다."]):
                 result, _ = counseling._subject_report(subject, {"subjectPercentile": 52}, concept)
-                step = result["learningGuide"].split("4단계")[1]
-                self.assertIn(concept, step)
+                step = result["learningGuide"].split("2단계")[1]
+                self.assertIn(concept, result["learningGuide"])
                 self.assertIn(expected, step)
                 self.assertNotIn("1443년", step)
 
@@ -110,6 +124,20 @@ class ReportFactsTest(TestCase):
         self.assertEqual('x = -2.5', complete_generation('x = -2.5'))
         self.assertEqual('', complete_generation(r'$\frac{1}{'))
 
+    def test_passage_keeps_formula_and_picks_the_requested_idea(self):
+        note = "다른 개념을 설명한다. 농도는 0.25 mol/L이다. 이때 농도와 단위를 함께 확인한다. 마지막으로 다른 개념을 다룬다."
+        self.assertEqual("농도는 0.25 mol/L이다. 이때 농도와 단위를 함께 확인한다.",
+                         material_excerpt(note, 80, "농도"))
+        self.assertEqual("", counseling._material_lines(["다른 단원에 관한 별개의 설명입니다."], "확률"))
+
+    def test_missing_concept_starts_from_recent_work_and_no_random_materials(self):
+        with patch.object(counseling, "subject_aware_search") as search:
+            result, _ = counseling._subject_report("수학", {}, "")
+            self.assertNotIn("[교과 자료]", result["careerAnalysis"])
+            self.assertIn("최근 배운 단원", result["learningGuide"])
+            self.assertIn("[스스로 확인]", result["learningGuide"])
+            search.assert_not_called()
+
 
 class ReportModelTest(IsolatedAsyncioTestCase):
     async def test_length_limit_drops_unfinished_ollama_tail(self):
@@ -119,6 +147,8 @@ class ReportModelTest(IsolatedAsyncioTestCase):
         self.assertEqual("수동태는 be와 과거분사를 씁니다.", await counseling._ollama_once(client, "prompt", 5, 100))
         client.post.return_value.json.return_value={"done_reason":"stop","response":"2x + 1"}
         self.assertEqual("2x + 1", await counseling._ollama_once(client, "prompt", 5, 100))
+        client.post.return_value.json.return_value={"done_reason":"length","response":"<think>내부 분석 내용입니다."}
+        self.assertIsNone(await counseling._ollama_once(client, "prompt", 5, 100))
 
     async def test_cpu_advice_has_one_bounded_generation(self):
         async_mock=AsyncMock(return_value="예문을 쓰세요.")
@@ -135,8 +165,19 @@ class ReportModelTest(IsolatedAsyncioTestCase):
             result = await counseling.report_subject("영어", {"studentId":7,"subjectPercentile":72,
                                                             "studyTime":1.5,"weakConcept":"수동태"})
         self.assertIn("영어 백분위 72%",result["careerAnalysis"])
-        self.assertNotIn("[AI 개념 심층 분석]",result["careerAnalysis"])
+        self.assertNotIn("[AI 개념 설명]",result["careerAnalysis"])
         self.assertIn("수동태",result["learningGuide"])
+
+    async def test_advice_and_observations_appear_in_separate_fields(self):
+        req = {"studentId": 7, "weakConcept": "비유", "weakSubject": "국어",
+               "subjectPercentile": 81, "instructorFeedback": "구절을 인용해 보세요."}
+        advice = "고른 구절을 가리고 뜻을 설명해 보세요."
+        with patch.object(counseling, "_advice", AsyncMock(return_value=advice)):
+            for endpoint in (counseling.report_writing, counseling.report_premium):
+                result = await endpoint(req)
+                self.assertIn(req["instructorFeedback"], result["careerAnalysis"])
+                self.assertNotIn(advice, result["careerAnalysis"])
+                self.assertIn("[AI 복습 제안]\n" + advice, result["learningGuide"])
 
 
 if __name__ == "__main__":

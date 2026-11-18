@@ -8,6 +8,68 @@ from src.api.linear_equation import solve_linear
 
 
 class AskQualityTest(unittest.TestCase):
+    def test_complete_answer_can_stand_alone(self):
+        answer = "달은 지구 주위를 도는 위성이고, 태양빛을 반사해 보입니다."
+        raw = json.dumps({"답변": answer, "근거": "", "유형": "자료"})
+        self.assertEqual(read_answer(raw, True), (answer, True, "answer"))
+        self.assertEqual(read_answer(json.dumps({"답변": answer, "유형": "자료"}), True),
+                         (None, False, "answer"))
+
+    def test_length_cap_keeps_only_completed_public_answer(self):
+        text = '{"답변":"지구의 위성입니다.", "근거":"태양빛이'
+        self.assertEqual(read_answer(text, True, length_limited=True), ("지구의 위성입니다.", False, "answer"))
+        self.assertEqual(read_answer(text, True), (None, False, "answer"))
+        self.assertEqual(read_answer('{"답변":"<think>숨김</think>","근거":"', False, length_limited=True),
+                         (None, False, "answer"))
+
+    def test_unrequested_extra_example_follows_the_complete_reason(self):
+        payload = json.dumps({"답변":"가격이 내려갑니다.", "근거":"공급 곡선이 오른쪽으로 이동합니다. 예를 들어, 생산비가 줄면 공급이 증가합니다.", "유형":"풀이"})
+        short = read_answer(payload, False, question="공급이 늘면 균형 가격은 어떻게 되나요?")[0]
+        self.assertEqual(short, "가격이 내려갑니다.\n공급 곡선이 오른쪽으로 이동합니다.")
+        example = read_answer(payload, False, question="왜 그런지 예시도 보여 주세요.")[0]
+        self.assertIn("생산비가 줄면", example)
+
+    def test_failed_generation_can_quote_exact_relevant_causal_evidence(self):
+        from src.api.ask_quality import verify_reported_claim
+        q = "보름달은 스스로 빛을 내는 별이라고 들었어요. 그래서 밤에 밝게 보이는 건가요?"
+        docs = search_concept_map("과학", q, 3)
+        answer, grounded = verify_reported_claim("과학", q, None, docs)
+        self.assertTrue(grounded)
+        self.assertIn("자연 위성", answer)
+        self.assertIn("반사", answer)
+        for excerpt in answer.splitlines():
+            self.assertIn(excerpt.removeprefix("교과 자료 · "), docs[0])
+        self.assertEqual(verify_reported_claim("과학", q, None, []), (None, False))
+        for unsupported in ("보름달은 거울 같다고 들었어요. 표면의 온도는 몇 도인가요?",
+                            "보름달의 온도는 얼마인가요?"):
+            self.assertEqual(verify_reported_claim("과학", unsupported, None, docs), (None, False))
+
+    def test_omit_repeated_wording_and_keep_new_support(self):
+        raw = json.dumps({"유형": "자료", "답변": "기체의 부피가 증가합니다.",
+                          "근거": "기체의 부피가 증가한다. 입자가 더 넓은 공간을 차지해요."})
+        self.assertEqual(read_answer(raw, True)[0], "기체의 부피가 증가합니다.\n입자가 더 넓은 공간을 차지해요.")
+        self.assertTrue(wants_answer_only("기체 종류는? 정답만 간단히 알려줘."))
+        self.assertFalse(wants_answer_only("정답만 알려주지 말고 설명해 줘."))
+
+    def test_evidence_keeps_polarity_direction_and_math(self):
+        cases = [("용액이 산성입니다.", "용액이 산성이 아닙니다."),
+                 ("A이면 B가 증가합니다.", "B이면 A가 증가합니다."),
+                 ("x = -2", "2"), ("값은 2.5입니다.", "5"),
+                 ("총 3200원입니다.", "800 × 4 = 3200")]
+        for answer, reason in cases:
+            with self.subTest(reason=reason):
+                raw = json.dumps({"답변": answer, "근거": reason, "유형": "풀이"})
+                self.assertEqual(read_answer(raw, False)[0], answer + "\n" + reason)
+
+    def test_standalone_english_cue_has_context(self):
+        raw = json.dumps({"답변": "그때부터 지금까지 계속 살고 있습니다.", "근거": "since 2020", "유형": "자료"})
+        answer = read_answer(raw, True)[0]
+        self.assertIn("판단에 쓰인 표현은 ‘since 2020’입니다.", answer)
+        self.assertFalse(read_answer(raw, True, answer_only=True)[0].endswith("since 2020’입니다."))
+        answer = "‘since 2020’에서 2020년이 시작 시점임을 알 수 있습니다."
+        raw = json.dumps({"답변": "정답: " + answer, "근거": "근거: since 2020", "유형": "자료"})
+        self.assertEqual(read_answer(raw, True)[0], answer)
+
     def test_reported_claim_adds_a_matching_definition(self):
         from src.api.ask_quality import verify_reported_claim
         text, cited = verify_reported_claim("과학", "초승달은 빛을 낸다고 들었는데 사실인가요?", "햇빛을 반사합니다.")
@@ -30,7 +92,7 @@ class AskQualityTest(unittest.TestCase):
         solution = solve_linear("4번 문제: 3x + 1 = 10일 때 x와 풀이를 알려 주세요.")
         self.assertTrue(solution.startswith("x = 3\n"))
         self.assertIn("3x = 9", solution)
-        self.assertIn("9 ÷ (3) = 3", solution)
+        self.assertIn("\n계수로 양변을 나눕니다. x = 9 ÷ 3 = 3", solution)
 
     def test_linear_equations_with_both_sides_and_fractional_results(self):
         for request, expected in [
@@ -128,6 +190,13 @@ class AskQualityTest(unittest.TestCase):
         async def internal(_body):
             return {"response":"<think>internal</think>결론", "done_reason":"stop"}
         self.assertIsNone(asyncio.run(_plain_retry(internal, "합성 문제", True)))
+        async def labeled(_body):
+            return {"response": "정답: 총 300원입니다.\n풀이: 100 × 3 = 300", "done_reason": "stop"}
+        self.assertEqual(asyncio.run(_plain_retry(labeled, "합성 문제", False)), "총 300원입니다.\n100 × 3 = 300")
+        self.assertEqual(asyncio.run(_plain_retry(labeled, "합성 문제", True)), "총 300원입니다.")
+        async def two_answers(_body):
+            return {"response": "x = 3\ny = -2\n근거: 대입합니다.", "done_reason": "stop"}
+        self.assertEqual(asyncio.run(_plain_retry(two_answers, "두 값만", True)), "x = 3\ny = -2")
 
 
 if __name__ == "__main__":

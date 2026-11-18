@@ -35,7 +35,7 @@ issues = []
 sep = lambda t: print(f"\n{'='*70}\n[{t}]\n{'='*70}")
 
 
-_RAG_HEADERS = ["[관련 학습 자료 검색 결과]"]
+_RAG_HEADERS = ["[교과 자료]", "[관련 학습 자료 검색 결과]"]
 
 
 def rag_lines(text: str) -> list[str]:
@@ -64,7 +64,7 @@ for subject in SUBJECTS:
     for tier_label, pct in TIERS:
         payload = {
             "studentId": "Q-TEST",
-            "currentKoreanGrade": pct,
+            "currentKoreanGrade": pct, "subjectPercentile": pct,
             "studyTime": 2,
             "recommendContext": CONCEPT_BY_SUBJECT[subject],
             "studentNote": f"{subject} 학습 특성 테스트",
@@ -114,7 +114,7 @@ for subject in SUBJECTS:
     guides = {}
     for tier_label, pct in TIERS:
         payload = {
-            "studentId": "Q-TEST", "currentKoreanGrade": pct, "studyTime": 2,
+            "studentId": "Q-TEST", "currentKoreanGrade": pct, "subjectPercentile": pct, "studyTime": 2,
             "recommendContext": CONCEPT_BY_SUBJECT[subject],
         }
         r = client.post(endpoint, json=payload)
