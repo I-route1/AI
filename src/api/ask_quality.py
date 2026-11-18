@@ -301,6 +301,29 @@ def wants_answer_only(question: str) -> bool:
                           r"|(?:설명|해설|풀이)\s*없이", question))
 
 
+_GENERATION_TIMEOUT = 40.0
+
+
+async def _stream_structured(client, payload: dict, chunks: list[str]) -> dict:
+    """Read only public response tokens; a closed connection alone is not a done event."""
+    async with client.stream("POST", OLLAMA_URL, json={**payload, "stream": True}) as response:
+        response.raise_for_status()
+        async for line in response.aiter_lines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict) or "error" in event or not isinstance(event.get("done"), bool):
+                raise ValueError("Invalid Ollama stream event")
+            token = event.get("response", "")
+            if not isinstance(token, str):
+                raise ValueError("Invalid Ollama response token")
+            if token:
+                chunks.append(token)
+            if event["done"]:
+                return {"response": "".join(chunks), "done_reason": event.get("done_reason")}
+    raise ValueError("Ollama stream ended without a completion event")
+
+
 async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_only: bool,
                         *, question: str = "") -> tuple[str | None, bool, str]:
     import httpx
@@ -309,28 +332,34 @@ async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_o
     payload = ollama_request(prompt, max_tokens=140 if OLLAMA_CPU else 300)
     payload.update(system=tutor_instruction(subject), format=_SCHEMA)
     payload["options"]["temperature"] = 0.1
+    chunks = []
     try:
         # 두 번의 생성이 시작되더라도 Spring의 50초 제한 안에서 함께 끝낸다.
-        async with asyncio.timeout(40), httpx.AsyncClient(timeout=40) as client:
+        async with asyncio.timeout(_GENERATION_TIMEOUT), httpx.AsyncClient(timeout=_GENERATION_TIMEOUT) as client:
             async def generate(body):
                 response = await client.post(OLLAMA_URL, json=body)
                 response.raise_for_status()
                 data = response.json()
                 return data if isinstance(data, dict) else {}
 
-            result = await generate(payload)
+            result = await _stream_structured(client, payload, chunks) if OLLAMA_CPU else await generate(payload)
+            chunks.clear()  # Never recover a rejected first result if a later plain retry times out.
             answer, grounded, kind = read_answer(
                 result.get("response"), has_reference,
                 length_limited=result.get("done_reason") == "length", answer_only=answer_only, question=question)
             if not answer:
                 logging.info("[AI 질문] JSON 응답 재생성: 종료=%s", result.get("done_reason"))
                 answer = await _plain_retry(generate, prompt, answer_only, question)
-        if answer and has_foreign(answer):
-            answer = strip_foreign(answer).strip()
-        return (answer, grounded, kind) if answer else _NO_ANSWER
-    except (httpx.HTTPError, ValueError, TimeoutError) as exc:
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        logging.warning("[AI 질문] Ollama 응답 시간 초과: %s", type(exc).__name__)
+        answer, grounded, kind = read_answer("".join(chunks), has_reference, length_limited=True,
+                                             answer_only=answer_only, question=question)
+    except (httpx.HTTPError, ValueError) as exc:
         logging.warning("[AI 질문] Ollama 응답 실패: %s", type(exc).__name__)
         return _NO_ANSWER
+    if answer and has_foreign(answer):
+        answer = strip_foreign(answer).strip()
+    return (answer, grounded, kind) if answer else _NO_ANSWER
 
 
 async def _plain_retry(generate, prompt: str, answer_only: bool, question: str = "") -> str | None:

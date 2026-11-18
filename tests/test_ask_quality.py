@@ -275,5 +275,75 @@ class AskQualityTest(unittest.TestCase):
         self.assertEqual(asyncio.run(_plain_retry(two_answers, "두 값만", True)), "x = 3\ny = -2")
 
 
+class TutorStreamTest(unittest.IsolatedAsyncioTestCase):
+    async def run_stream(self, events, *, stall=False, retries=None):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import httpx
+        from src.api import ask_quality
+
+        class Stream(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                for event in events:
+                    data = (json.dumps(event, ensure_ascii=False) + "\n").encode()
+                    yield data[:9]
+                    yield data[9:]
+                if stall:
+                    await asyncio.Event().wait()
+
+            async def aclose(self):
+                self.closed = True
+
+        stream = Stream()
+        def handler(request):
+            body = json.loads(request.content)
+            if body["stream"]:
+                self.assertIn("format", body)
+                return httpx.Response(200, stream=stream)
+            self.assertIsNotNone(retries, "Unexpected extra generation")
+            return httpx.Response(200, json=retries)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        # These transport tests don't load the Torch-based character filter.
+        script_guard = SimpleNamespace(has_foreign=lambda _: False, strip_foreign=lambda s: s)
+        with (patch.object(ask_quality, "OLLAMA_CPU", True),
+              patch.object(ask_quality, "_GENERATION_TIMEOUT", 0.12 if stall else 2),
+              patch.dict(sys.modules, {"src.api.script_guard": script_guard}),
+              patch.object(httpx, "AsyncClient", return_value=client)):
+            result = await ask_quality.ollama_answer("영어", "합성 질문", True, False)
+        self.assertTrue(client.is_closed)
+        self.assertTrue(stream.closed)
+        return result
+
+    async def test_ndjson_completion_uses_only_the_public_response(self):
+        events = [{"done":False, "thinking":"비공개 추론", "response":'{"답변":"느낌을 나타냅니다.",'},
+                  {"done":False, "response":'"근거":"주어가 감정을 느낍니다.",'},
+                  {"done":True, "done_reason":"stop", "response":'"유형":"자료"}'}]
+        result = await self.run_stream(events)
+        self.assertEqual(result, ("느낌을 나타냅니다.\n주어가 감정을 느낍니다.", True, "answer"))
+
+    async def test_deadline_recovers_a_closed_public_field_only(self):
+        events = [{"done":False, "response":'{"답변":"I am bored가 맞습니다.", "근거":"아직 생성 중'}]
+        self.assertEqual(await self.run_stream(events, stall=True), ("I am bored가 맞습니다.", False, "answer"))
+        for token in ("", '{"답변":"아직 생성 중', '{"답변":"<think>비공개</think>", "근거":"'):
+            with self.subTest(token=token):
+                self.assertEqual(await self.run_stream([{"done":False, "thinking":"내부 정보", "response":token}],
+                                                      stall=True), (None, False, "answer"))
+
+    async def test_eof_or_error_is_not_a_successful_completion(self):
+        chunk = {"done":False, "response":'{"답변":"예", "근거":"", "유형":"풀이"}'}
+        for last in ([], [{"error":"model failed"}], [{"done":"true"}], [{"done":True, "response":5}]):
+            with self.subTest(last=last):
+                self.assertEqual(await self.run_stream([chunk, *last]), (None, False, "answer"))
+
+    async def test_malformed_generation_can_use_existing_plain_recovery(self):
+        events = [{"done":True, "done_reason":"stop", "response":"{}"}]
+        self.assertEqual(await self.run_stream(events, retries={"response":"주어의 느낌을 말합니다.", "done_reason":"stop"}),
+                         ("주어의 느낌을 말합니다.", False, "answer"))
+
+
 if __name__ == "__main__":
     unittest.main()
