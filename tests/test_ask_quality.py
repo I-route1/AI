@@ -276,7 +276,7 @@ class AskQualityTest(unittest.TestCase):
 
 
 class TutorStreamTest(unittest.IsolatedAsyncioTestCase):
-    async def run_stream(self, events, *, stall=False, retries=None):
+    async def run_stream(self, events, *, stall=False, retries=None, question=""):
         import sys
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -313,7 +313,7 @@ class TutorStreamTest(unittest.IsolatedAsyncioTestCase):
               patch.object(ask_quality, "_GENERATION_TIMEOUT", 0.12 if stall else 2),
               patch.dict(sys.modules, {"src.api.script_guard": script_guard}),
               patch.object(httpx, "AsyncClient", return_value=client)):
-            result = await ask_quality.ollama_answer("영어", "합성 질문", True, False)
+            result = await ask_quality.ollama_answer("영어", "합성 질문", True, False, question=question)
         self.assertTrue(client.is_closed)
         self.assertTrue(stream.closed)
         return result
@@ -324,6 +324,46 @@ class TutorStreamTest(unittest.IsolatedAsyncioTestCase):
                   {"done":True, "done_reason":"stop", "response":'"유형":"자료"}'}]
         result = await self.run_stream(events)
         self.assertEqual(result, ("느낌을 나타냅니다.\n주어가 감정을 느낍니다.", True, "answer"))
+
+    async def test_deployed_length_capped_answer_ends_inside_unsolicited_example(self):
+        question = ("수업을 들으면서 내가 지루함을 느낀다는 뜻에는 I am bored와 I am boring 중 어느 문장이 맞나요? "
+                    "다른 문장이 뜻하는 것도 알려 주세요.")
+        lead = "I am bored가 맞습니다. I am boring은 '내가 지루한 사람이다'라는 뜻입니다."
+        reason = ("I am bored는 '나는 지루하다'는 뜻으로, 수업을 들으면서 지루함을 느낀다는 상황에 적합합니다. "
+                  "반면, I am boring은 '나는 지루한 사람이다'라는 뜻으로, 상대방에게 지루하게 느껴지는 자신의 상태를 표현할 때 사용됩니다.")
+        tail = "예시: \n- I am bored during the class. (수업 중에 나는 지루하다.)\n- He"
+        raw = json.dumps({"답변": "\n\n".join((lead, reason, tail))}, ensure_ascii=False)[:-2]
+        events = [{"response": raw, "done": True, "done_reason": "length"}]
+        self.assertEqual(await self.run_stream(events, question=question), (lead + "\n" + reason, False, "answer"))
+        self.assertEqual(read_answer(raw, True, length_limited=True, answer_only=True, question=question)[0], lead)
+        self.assertIsNone(read_answer(raw, True, question=question)[0])
+
+    def test_open_field_recovery_requires_complete_public_prose_and_unrequested_example_heading(self):
+        question = "이 표현의 의미를 알려 주세요."
+        def opening(answer):
+            return json.dumps({"답변": answer}, ensure_ascii=True)[:-2]
+        lead = '표현의 뜻은 "기다린다"입니다.'
+        positive = opening(f"{lead}\n\n{lead} 지금도 그 동작이 이어집니다.\n\n예문：\n- 첫")
+        result = read_answer(positive, True, length_limited=True, question=question)
+        self.assertEqual(result, (lead + "\n지금도 그 동작이 이어집니다.", False, "answer"))
+        for q in ("예문도 하나 써 주세요.", "Give me an example.", "사례를 적용해 주세요.", ""):
+            with self.subTest(q=q):
+                self.assertIsNone(read_answer(positive, True, length_limited=True, question=q)[0])
+        for malformed in (
+            '{"근거":' + positive.split(":", 1)[1],
+            '{"결과":' + positive,
+            '{"답변":"첫 번째입니다.",' + positive[1:],
+            positive + r"\q", positive + r"\u123", positive + '" trailing',
+            opening("결론은 아직\n\n예시: 뒤"), opening("단어의 뜻은.\n\n예시: 뒤"),
+            opening("정답입니다.\n마저 설명하면\n\n예시: 뒤"),
+            opening("정답입니다.\n예시: 뒤"), opening("정답입니다.\n\n예시로 들다가"),
+            opening("값은 $x+ 입니다.\n\n예시: 뒤"),
+            opening("괄호가 (열렸습니다.\n\n예시: 뒤"),
+            opening("결론입니다.\n\n예시: <think>비공개"),
+            opening("결론입니다.\n\n예시: <|analysis|>비공개"),
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(read_answer(malformed, True, length_limited=True, question=question)[0])
 
     async def test_deadline_recovers_a_closed_public_field_only(self):
         events = [{"done":False, "response":'{"답변":"I am bored가 맞습니다.", "근거":"아직 생성 중'}]

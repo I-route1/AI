@@ -245,19 +245,60 @@ def _completed_fields(text: str) -> dict[str, str]:
     fields = {}
     prefix = r"\{\s*"
     index = 0
-    while match := re.match(prefix + r'"(근거|답변|유형)"\s*:\s*', text[index:]):
-        key = match.group(1)
-        if key in fields:
-            return {}
+    while match := re.match(prefix, text[index:]):
         try:
-            value, index = decoder.raw_decode(text, index + match.end())
+            key, index = decoder.raw_decode(text, index + match.end())
         except ValueError:
             break
-        if not isinstance(value, str):
+        if key not in ("근거", "답변", "유형") or key in fields:
+            return {}
+        colon = re.match(r"\s*:\s*", text[index:])
+        if not colon:
+            break
+        try:
+            value, index = decoder.raw_decode(text, index + colon.end())
+        except ValueError:
+            break
+        rest = text[index:].lstrip()
+        if not isinstance(value, str) or (rest and not rest.startswith(",") and rest != "}"):
             return {}
         fields[key] = value
         prefix = r"\s*,\s*"
     return fields
+
+
+def _answer_before_extra_examples(text: str, question: str) -> dict[str, str]:
+    """Recover prose only when a length-capped answer has moved on to unsolicited examples."""
+    if not question or re.search(r"예시|예문|예제|예로|예를|예\s|사례|보기|실생활|시나리오|적용|어떤\s*경우"
+                                 r"|(?:문장|문제).{0,8}(?:만들|지어|써\s*줘)|\bexamples?\b", question, re.I):
+        return {}
+    try:
+        # Accept only an object with one open public string. Preserve key pairs to reject duplicates.
+        fields = json.loads(text + '"}', object_pairs_hook=tuple)
+    except ValueError:
+        return {}
+    if not isinstance(fields, tuple) or len(fields) != 1 or fields[0][0] != "답변":
+        return {}
+    value = fields[0][1]
+    if not isinstance(value, str):
+        return {}
+    if re.search(r"[<>{}\[\]\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]", value):
+        return {}
+    heading = re.search(r"\n[ \t]*\n(?:예시|예문|예제)[ \t]*[:：]", value)
+    if not heading:
+        return {}
+    paragraphs = [part.strip() for part in re.split(r"\n[ \t]*\n", value[:heading.start()])]
+    # This fallback is for ordinary prose. Equations, unfinished quotations and
+    # multi-line lists require a closed JSON field on the normal path.
+    if len(paragraphs) > 2 or any(
+        not re.search(r"(?:다|요|죠)[.!?]$", part)
+        or re.search(r"[\n$\\=×÷+*/^−]|-\s*[.!?]", part)
+        or part.count('"') % 2 or part.count("'") % 2
+        or any(part.count(left) != part.count(right) for left, right in (("(", ")"), ("“", "”"), ("‘", "’")))
+        for part in paragraphs
+    ):
+        return {}
+    return {"답변": paragraphs[0], "근거": paragraphs[1] if len(paragraphs) == 2 else "", "유형": "풀이"}
 
 
 def read_answer(
@@ -275,6 +316,8 @@ def read_answer(
         if not length_limited and not _THINK_TAG.search(text):
             return _NO_ANSWER
         data = _completed_fields(text)
+        if not data and length_limited:
+            data = _answer_before_extra_examples(text, question)
         if "답변" in data:
             data.setdefault("근거", "")
         data.setdefault("유형", "풀이")
