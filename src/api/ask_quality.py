@@ -245,19 +245,60 @@ def _completed_fields(text: str) -> dict[str, str]:
     fields = {}
     prefix = r"\{\s*"
     index = 0
-    while match := re.match(prefix + r'"(근거|답변|유형)"\s*:\s*', text[index:]):
-        key = match.group(1)
-        if key in fields:
-            return {}
+    while match := re.match(prefix, text[index:]):
         try:
-            value, index = decoder.raw_decode(text, index + match.end())
+            key, index = decoder.raw_decode(text, index + match.end())
         except ValueError:
             break
-        if not isinstance(value, str):
+        if key not in ("근거", "답변", "유형") or key in fields:
+            return {}
+        colon = re.match(r"\s*:\s*", text[index:])
+        if not colon:
+            break
+        try:
+            value, index = decoder.raw_decode(text, index + colon.end())
+        except ValueError:
+            break
+        rest = text[index:].lstrip()
+        if not isinstance(value, str) or (rest and not rest.startswith(",") and rest != "}"):
             return {}
         fields[key] = value
         prefix = r"\s*,\s*"
     return fields
+
+
+def _answer_before_extra_examples(text: str, question: str) -> dict[str, str]:
+    """Recover prose only when a length-capped answer has moved on to unsolicited examples."""
+    if not question or re.search(r"예시|예문|예제|예로|예를|예\s|사례|보기|실생활|시나리오|적용|어떤\s*경우"
+                                 r"|(?:문장|문제).{0,8}(?:만들|지어|써\s*줘)|\bexamples?\b", question, re.I):
+        return {}
+    try:
+        # Accept only an object with one open public string. Preserve key pairs to reject duplicates.
+        fields = json.loads(text + '"}', object_pairs_hook=tuple)
+    except ValueError:
+        return {}
+    if not isinstance(fields, tuple) or len(fields) != 1 or fields[0][0] != "답변":
+        return {}
+    value = fields[0][1]
+    if not isinstance(value, str):
+        return {}
+    if re.search(r"[<>{}\[\]\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]", value):
+        return {}
+    heading = re.search(r"\n[ \t]*\n(?:예시|예문|예제)[ \t]*[:：]", value)
+    if not heading:
+        return {}
+    paragraphs = [part.strip() for part in re.split(r"\n[ \t]*\n", value[:heading.start()])]
+    # This fallback is for ordinary prose. Equations, unfinished quotations and
+    # multi-line lists require a closed JSON field on the normal path.
+    if len(paragraphs) > 2 or any(
+        not re.search(r"(?:다|요|죠)[.!?]$", part)
+        or re.search(r"[\n$\\=×÷+*/^−]|-\s*[.!?]", part)
+        or part.count('"') % 2 or part.count("'") % 2
+        or any(part.count(left) != part.count(right) for left, right in (("(", ")"), ("“", "”"), ("‘", "’")))
+        for part in paragraphs
+    ):
+        return {}
+    return {"답변": paragraphs[0], "근거": paragraphs[1] if len(paragraphs) == 2 else "", "유형": "풀이"}
 
 
 def read_answer(
@@ -275,6 +316,8 @@ def read_answer(
         if not length_limited and not _THINK_TAG.search(text):
             return _NO_ANSWER
         data = _completed_fields(text)
+        if not data and length_limited:
+            data = _answer_before_extra_examples(text, question)
         if "답변" in data:
             data.setdefault("근거", "")
         data.setdefault("유형", "풀이")
@@ -301,6 +344,29 @@ def wants_answer_only(question: str) -> bool:
                           r"|(?:설명|해설|풀이)\s*없이", question))
 
 
+_GENERATION_TIMEOUT = 40.0
+
+
+async def _stream_structured(client, payload: dict, chunks: list[str]) -> dict:
+    """Read only public response tokens; a closed connection alone is not a done event."""
+    async with client.stream("POST", OLLAMA_URL, json={**payload, "stream": True}) as response:
+        response.raise_for_status()
+        async for line in response.aiter_lines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict) or "error" in event or not isinstance(event.get("done"), bool):
+                raise ValueError("Invalid Ollama stream event")
+            token = event.get("response", "")
+            if not isinstance(token, str):
+                raise ValueError("Invalid Ollama response token")
+            if token:
+                chunks.append(token)
+            if event["done"]:
+                return {"response": "".join(chunks), "done_reason": event.get("done_reason")}
+    raise ValueError("Ollama stream ended without a completion event")
+
+
 async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_only: bool,
                         *, question: str = "") -> tuple[str | None, bool, str]:
     import httpx
@@ -309,28 +375,34 @@ async def ollama_answer(subject: str, prompt: str, has_reference: bool, answer_o
     payload = ollama_request(prompt, max_tokens=140 if OLLAMA_CPU else 300)
     payload.update(system=tutor_instruction(subject), format=_SCHEMA)
     payload["options"]["temperature"] = 0.1
+    chunks = []
     try:
         # 두 번의 생성이 시작되더라도 Spring의 50초 제한 안에서 함께 끝낸다.
-        async with asyncio.timeout(40), httpx.AsyncClient(timeout=40) as client:
+        async with asyncio.timeout(_GENERATION_TIMEOUT), httpx.AsyncClient(timeout=_GENERATION_TIMEOUT) as client:
             async def generate(body):
                 response = await client.post(OLLAMA_URL, json=body)
                 response.raise_for_status()
                 data = response.json()
                 return data if isinstance(data, dict) else {}
 
-            result = await generate(payload)
+            result = await _stream_structured(client, payload, chunks) if OLLAMA_CPU else await generate(payload)
+            chunks.clear()  # Never recover a rejected first result if a later plain retry times out.
             answer, grounded, kind = read_answer(
                 result.get("response"), has_reference,
                 length_limited=result.get("done_reason") == "length", answer_only=answer_only, question=question)
             if not answer:
                 logging.info("[AI 질문] JSON 응답 재생성: 종료=%s", result.get("done_reason"))
                 answer = await _plain_retry(generate, prompt, answer_only, question)
-        if answer and has_foreign(answer):
-            answer = strip_foreign(answer).strip()
-        return (answer, grounded, kind) if answer else _NO_ANSWER
-    except (httpx.HTTPError, ValueError, TimeoutError) as exc:
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        logging.warning("[AI 질문] Ollama 응답 시간 초과: %s", type(exc).__name__)
+        answer, grounded, kind = read_answer("".join(chunks), has_reference, length_limited=True,
+                                             answer_only=answer_only, question=question)
+    except (httpx.HTTPError, ValueError) as exc:
         logging.warning("[AI 질문] Ollama 응답 실패: %s", type(exc).__name__)
         return _NO_ANSWER
+    if answer and has_foreign(answer):
+        answer = strip_foreign(answer).strip()
+    return (answer, grounded, kind) if answer else _NO_ANSWER
 
 
 async def _plain_retry(generate, prompt: str, answer_only: bool, question: str = "") -> str | None:
