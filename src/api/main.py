@@ -37,7 +37,7 @@ from src.api.adapters import (
     MATH_SYSTEM_PROMPT, SUBJECT_ADAPTERS,
 )
 from src.api.routers import counseling, predictor, writing, rag
-from src.api.routers.counseling import _material_lines, _report_ollama, _report_prompt, _study_guide
+from src.api.routers.counseling import _material_lines, _source_review, _study_guide
 from src.api.generation import ADVICE_GEN, CONCEPT_GEN, ollama_request
 from src.api.postprocess import strip_chat_frame, strip_markdown, trim_cut_tail
 from src.api.script_guard import (ForeignScriptBlocker, foreign_token_mask, has_foreign,
@@ -412,20 +412,9 @@ async def generate_subject_recommendation(
     if rag_text:
         report += f"\n[교과 자료]\n{rag_text}\n"
 
-    # 베이스 Qwen으로 생성하고, _concept_explain()이 None을 주는 과목만 Ollama로 넘긴다.
-    # GPU 생성은 수 초가 걸리는 블로킹 작업이라 threadpool로 빼서 이벤트 루프를 막지 않는다.
-    prompt = _report_prompt(subject, concept_query, rag_docs) if observed else ""
-    llm_insight = await run_in_threadpool(_concept_explain, subject, concept_query, rag_docs, prompt) if observed else None
-    if llm_insight:
-        fallback_stats.record("concept", "qwen")
-
-    if observed and not llm_insight:
-        llm_insight = await _report_ollama(prompt)
-        fallback_stats.record("concept", "ollama" if llm_insight else "none")
-
-    if llm_insight:
-        report += f"\n[AI 개념 설명]\n{llm_insight}\n"
-    report += "\n" + _study_guide(subject, concept_query, rag_text)
+    if observed:
+        report += await _source_review(subject, concept_query, rag_text)
+    report += "\n\n" + _study_guide(subject, concept_query, rag_text)
 
     return {
         "studentId": student_id,

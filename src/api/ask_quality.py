@@ -1,5 +1,6 @@
 """학생에게 표시할 답변과 자료 사용 여부를 서로 다른 필드로 생성한다."""
 import asyncio
+from fractions import Fraction
 import json
 import logging
 import re
@@ -29,6 +30,54 @@ _EXERCISE_REFERENCE = re.compile(
 
 def missing_exercise(question: str) -> bool:
     return _EXERCISE_REFERENCE.fullmatch(question) is not None
+
+
+_PART_OF_WHOLE = re.compile(
+    r"(?:전체|총)?\s*(?P<whole>[0-9]{1,6})\s*(?P<unit>개|명|장|권|마리|문제|문항)\s*(?:중(?:에서)?|가운데)\s*"
+    r"(?P<part>[0-9]{1,6})\s*(?P=unit)\s*[을를의]?\s*"
+    r"(?:(?:골랐|뽑았|선택했|맞혔|참여했|출석했)(?:습니다|어요|다)[.!]?\s*)?"
+    r"(?:(?:(?:고른|뽑은|선택한|맞힌|참여한|출석한)\s*)?비율[을은]?)?\s*"
+    r"(?:기약\s*분수\s*(?:와|및|,)\s*백분율|백분율\s*(?:과|및|,)\s*기약\s*분수)"
+    r"(?P<task>.*)"
+)
+_REPRESENTATION_WORDS = re.compile(
+    r"두\s*가지|로|을|를|각각|모두|쓰고|쓰세요|써|나타내(?:고|어|면|세요)?|구하(?:고|세요)|구해|"
+    r"서로|어떻게|왜|바꾸(?:는지|나요)|바꿀\s*수\s*있는지|양방향으로|변환\s*방법|설명(?:해|하세요)|"
+    r"정답만|답만|간단히|알려|주세요|줘요|줘|[\s.,!?]"
+)
+
+
+def part_whole_answer(question: str, *, answer_only: bool = False) -> str | None:
+    """Solve a single stated part of a whole when both representations are requested."""
+    match = _PART_OF_WHOLE.fullmatch(question.strip())
+    if not match or _REPRESENTATION_WORDS.sub("", match["task"]):
+        return None
+    if not re.search(r"쓰|써|나타내|구하|구해|알려|설명|\?", match["task"]):
+        return None
+    total, part = int(match["whole"]), int(match["part"])
+    if not 0 <= part <= total or total == 0:
+        return None
+    ratio = Fraction(part, total)
+    fraction = f"{ratio.numerator}/{ratio.denominator}"
+    percentage = 100 * ratio
+    integer, remainder = divmod(percentage.numerator, percentage.denominator)
+    digits = []
+    # A six-digit denominator needs at most 19 decimal places if it terminates.
+    while remainder and len(digits) < 19:
+        digit, remainder = divmod(10 * remainder, percentage.denominator)
+        digits.append(str(digit))
+    percent = str(integer) + ("." + "".join(digits) if digits else "")
+    if remainder:
+        percent = f"({percentage})"
+    answer = f"기약분수는 {fraction}, 백분율은 {percent}%입니다."
+    if answer_only:
+        return answer
+    base = f"{part}/{total}"
+    if base != fraction:
+        base += f" = {fraction}"
+    return (f"{answer}\n전체에 대한 부분의 비를 분수로 쓰면 {base}입니다. "
+            f"분수를 백분율로 바꿀 때는 100을 곱한 값에 %를 붙입니다. {fraction} × 100 = {percent}\n"
+            f"반대로 %를 떼고 100으로 나누면 원래 분수가 됩니다. {percent}% = {percent} ÷ 100 = {fraction}")
 
 
 def availability_notice(question: str) -> str | None:
@@ -99,7 +148,7 @@ _SYSTEM = (
     "중고등학생의 교과 질문에 한국어로 답하는 교사입니다. "
     "답변에는 학생이 물은 각 항목의 결론을 먼저 짧게 씁니다. "
     "근거는 예문의 단서가 뜻하는 바나 원리를 한 문장으로, 계산이면 중간 식으로 씁니다. "
-    "비교할 두 대상의 뜻은 한 번씩만 설명합니다. 예시는 요청할 때만 씁니다. "
+    "비교할 두 항목은 각각 설명합니다. 예시는 요청할 때만 씁니다. "
     "이미 이유까지 답했으면 근거는 빈 문자열로 둡니다. 사실과 다른 전제는 바로잡습니다. "
     "자료에 없는 수치나 출처를 지어내지 않습니다. "
     "유형은 참고 자료의 원리를 실제 사용하면 '자료', 일반 지식이나 계산으로 풀면 '풀이', "
@@ -127,6 +176,28 @@ _SCHEMA = {
 }
 _NO_ANSWER = (None, False, "answer")
 _THINK_TAG = re.compile(r"</?think\b|<\|(?:im_|think)", re.IGNORECASE)
+_QUOTES = r"""["'‘’“”`]*"""
+_TYPE_LABEL = rf"{_QUOTES}유형{_QUOTES}\s*[:：]\s*"
+_TYPE_VALUE = rf"{_QUOTES}(?:{'|'.join(_KINDS)}){_QUOTES}\s*[.,，。]?"
+_FIELD_LABEL = re.compile(rf"^(?:{_QUOTES}(?:답변|정답|근거|풀이|설명){_QUOTES}\s*[:：]\s*)+")
+_REASON_LABEL = re.compile(rf"^{_QUOTES}(?:근거|풀이|설명){_QUOTES}\s*[:：]")
+
+
+def _public_text(text: str, *, answer_only: bool = False) -> str:
+    """Remove model field labels from complete lines, preserving their contents."""
+    text = strip_chat_frame(strip_markdown(text))
+    # Match the entire metadata field. A sentence discussing a 유형 or naming an
+    # actual school category such as '서술형' is part of the student's answer.
+    text = re.sub(rf"^[ \t]*{_TYPE_LABEL}{_TYPE_VALUE}[ \t]*$", "", text, flags=re.MULTILINE)
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if answer_only and lines and _REASON_LABEL.match(line):
+            break
+        line = _FIELD_LABEL.sub("", line)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def _reading_form(text: str) -> str:
@@ -214,8 +285,8 @@ def read_answer(
         return _NO_ANSWER
     if _THINK_TAG.search(answer) or _THINK_TAG.search(reason):
         return _NO_ANSWER
-    answer = re.sub(r"^(?:답변|정답)\s*[:：]\s*", "", strip_chat_frame(strip_markdown(answer)))
-    reason = re.sub(r"^(?:근거|풀이|설명)\s*[:：]\s*", "", strip_chat_frame(strip_markdown(reason)))
+    answer = _public_text(answer, answer_only=answer_only)
+    reason = _public_text(reason)
     if not answer:
         return _NO_ANSWER
     if not answer_only and mode in ("자료", "풀이") and (reason := _explanation(answer, reason, question)):
@@ -282,17 +353,9 @@ async def _plain_retry(generate, prompt: str, answer_only: bool, question: str =
         if not endings:
             return None
         text = text[:endings[-1].end()]
-    lines = strip_chat_frame(strip_markdown(text)).splitlines()
-    answer = re.sub(r"^(?:답변|정답)\s*[:：]\s*", "", lines[0]) if lines else ""
-    if not answer or len(lines) < 2:
-        return answer or None
-    rest = "\n".join(lines[1:]).strip()
-    reason_label = r"^(?:근거|풀이|설명)\s*[:：]\s*"
-    if answer_only:
-        # A list of requested answers may need several lines. Only remove a
-        # separately labelled explanation when its role can be identified.
-        extra_answers = re.split(reason_label, rest, maxsplit=1, flags=re.MULTILINE)[0].rstrip()
-        return "\n".join(filter(None, (answer, extra_answers)))
-    reason = re.sub(reason_label, "", rest)
-    explanation = _explanation(answer, reason, question)
+    public_text = _public_text(text, answer_only=answer_only)
+    if not public_text or answer_only:
+        return public_text or None
+    answer, _, rest = public_text.partition("\n")
+    explanation = _explanation(answer, rest, question)
     return f"{answer}\n{explanation}" if explanation else answer

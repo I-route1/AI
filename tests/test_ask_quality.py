@@ -8,6 +8,82 @@ from src.api.linear_equation import solve_linear
 
 
 class AskQualityTest(unittest.TestCase):
+    def test_part_of_whole_supplies_both_exact_conversions(self):
+        from src.api.ask_quality import part_whole_answer
+        for question in (
+            "전체 12개 중 3개를 골랐어요. 고른 비율을 기약분수와 백분율 두 가지로 쓰고, 서로 어떻게 바꾸는지 설명해 주세요.",
+            "전체 12개 중 3개를 기약분수와 백분율로 각각 나타내고, 왜 서로 바꿀 수 있는지 양방향으로 설명해 줘."
+        ):
+            answer = part_whole_answer(question)
+            self.assertIn("3/12 = 1/4", answer)
+            self.assertIn("1/4 × 100 = 25", answer)
+            self.assertIn("25 ÷ 100 = 1/4", answer)
+        for whole, part, expected in [(8, 3, "37.5"), (3, 1, "(100/3)"), (17, 17, "100"), (12, 0, "0")]:
+            q = f"총 {whole}명 가운데 {part}명의 비율을 백분율과 기약분수로 써 주세요."
+            direct = part_whole_answer(q, answer_only=True)
+            self.assertIn(expected + "%", direct)
+            self.assertNotIn("\n", direct)
+
+    def test_unrelated_or_ambiguous_count_tasks_go_to_the_tutor(self):
+        from src.api.ask_quality import part_whole_answer
+        for q in ("전체 4개 중 5개를 기약분수와 백분율로 써 주세요.",
+                  "0개 중 0개를 기약분수와 백분율로 써 주세요.",
+                  "전체 12개 중 3개를 고르지 않았어요. 고른 비율을 기약분수와 백분율로 써 주세요.",
+                  "전체 12개 중 3개를 고르고 4개를 더 골랐어요. 기약분수와 백분율로 써 주세요.",
+                  "전체 12개 중 3개를 기약분수와 백분율로 쓰지 말고 소수로 써 주세요.",
+                  "전체 12개 중 3개의 기약분수와 백분율", "전체 12명 중 3개를 기약분수와 백분율로 나타내세요.",
+                  "전체 12개 중 3개의 백분율만 써 주세요.",
+                  "12개 중 3개를 다시 뽑을 확률을 기약분수와 백분율로 나타내세요."):
+            with self.subTest(q=q):
+                self.assertIsNone(part_whole_answer(q))
+
+    def test_ratio_at_question_endpoint_with_automatic_or_chosen_subject(self):
+        from unittest.mock import AsyncMock, patch
+        # This existing router fixture uses the real ConceptMap and no vector index.
+        from test_report_quality_regression import counseling
+        q = "총 8명 중 3명의 비율을 기약분수와 백분율로 나타내세요."
+        with (patch.object(counseling, "subject_aware_search", return_value=[]) as lookup,
+              patch.object(counseling.model_registry, "get", return_value=None),
+              patch.object(counseling, "ollama_answer", new_callable=AsyncMock,
+                           return_value=("영어 풀이", False, "answer")) as tutor):
+            for req in ({"question": q}, {"question": q, "subject":"수학"}):
+                result = asyncio.run(counseling.ai_ask(req))
+                self.assertEqual(result["subject"], "수학")
+                self.assertIn("37.5 ÷ 100 = 3/8", result["answer"])
+            self.assertTrue(asyncio.run(counseling.ai_ask({"question":"이게 왜 그래요?"}))["needSubject"])
+            missing = asyncio.run(counseling.ai_ask({"subject":"수학", "question":"4번 문제 알려 주세요."}))
+            self.assertEqual(missing["answerKind"], "clarification")
+            lookup.assert_not_called()
+            tutor.assert_not_awaited()
+            chosen = asyncio.run(counseling.ai_ask({"subject":"영어", "question": q}))
+            self.assertEqual((chosen["subject"], chosen["answer"]), ("영어", "영어 풀이"))
+
+    def test_deployed_fraction_answer_removes_model_field_labels(self):
+        lead = "고른 비율은 1/4, 25%입니다. 기약분수와 백분율은 서로를 곱하거나 나누어 바꿀 수 있습니다."
+        reason = "3/12=1/4, 1/4×100=25%. 기약분수는 분자와 분모를 최대공약수로 나누어 구하고, 백분율은 기약분수를 100으로 곱하여 구합니다."
+        leaked = f"{lead}\n근거: {reason}\n유형: '풀이'."
+        expected = f"{lead}\n{reason}"
+        raw = json.dumps({"답변": leaked, "근거": "", "유형": "풀이"})
+        self.assertEqual(read_answer(raw, False)[0], expected)
+        self.assertEqual(read_answer(raw, False, answer_only=True)[0], lead)
+        async def generate(_body):
+            return {"response":leaked, "done_reason":"stop"}
+        self.assertEqual(asyncio.run(_plain_retry(generate, "비율을 설명해 주세요.", False)), expected)
+
+    def test_metadata_is_distinct_from_an_actual_school_classification(self):
+        lead = "방정식의 유형은 일차방정식입니다."
+        formula = r"$x=-2.5,\ y=\frac{1}{4}$"
+        reason = "유형: 서술형\n이 유형은 풀이 과정을 평가합니다.\n" + formula
+        for metadata in ("‘유형’： “자료”。", '"유형": "풀이",', "유형:\n‘범위밖’."):
+            raw = json.dumps({"답변":"답변: 정답: " + lead,
+                              "근거":"근거: 근거: " + reason + "\n" + metadata, "유형":"풀이"})
+            answer = read_answer(raw, False)[0]
+            self.assertTrue(answer.startswith(lead))
+            self.assertIn("유형: 서술형", answer)
+            self.assertIn("이 유형은 풀이 과정을 평가합니다.", answer)
+            self.assertIn(formula, answer)
+            self.assertNotIn(metadata, answer)
+
     def test_complete_answer_can_stand_alone(self):
         answer = "달은 지구 주위를 도는 위성이고, 태양빛을 반사해 보입니다."
         raw = json.dumps({"답변": answer, "근거": "", "유형": "자료"})
